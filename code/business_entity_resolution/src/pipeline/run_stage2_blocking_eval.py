@@ -63,8 +63,9 @@ def strategy_sets(max_df, token_max_df, addr_max_df, pair_max_df):
         # - exact_name, core_name, core_name_translit: each lost <= 16 true
         #   matches when removed; subsumed by the skeleton core key
         "full": [
-            # token cap from a 25..1000 sweep: 200 keeps 93.6% recall (vs
-            # 94.1% at 1000) at 189 cands/S1 (vs 291)
+            # token cap: 200 was picked from a 25..1000 sweep, then lowered to 100
+            # once leave-one-out showed it the least efficient strategy (0.61 pts
+            # unique recall for ~30 cands/S1 at cap 200)
             KeyBlock(
                 f"name_token|country[{token_max_df}]", TokenKeys(NORM), token_max_df
             ),
@@ -146,6 +147,20 @@ def load_inputs():
     return s1, pool, gt_s1.to_numpy(), gt_pool.to_numpy()
 
 
+def same_country_space(s1, pool) -> int:
+    """Pairs a brute-force same-country comparison would evaluate."""
+    pool_counts = pd.Series(pool["country"].to_numpy(zero_copy_only=False)).value_counts()
+    s1_countries = pd.Series(s1["country"].to_numpy(zero_copy_only=False))
+    return int(s1_countries.map(pool_counts).fillna(0).sum())
+
+
+def precision_view(report: pd.DataFrame) -> str:
+    cols = ["strategy", "recall", "pair_precision", "macro_precision",
+            "macro_f05_all_cands", "new_pair_precision", "solo_precision",
+            "avg_cands", "reduction_ratio"]
+    return format_report(report, cols)
+
+
 def miss_breakdown(s1, pool, miss_s1, miss_pool, field):
     """Why were true matches missed? Joins missed pairs back to their text."""
     a = s1.take(pa.array(miss_s1)).to_pandas()
@@ -210,7 +225,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sets", nargs="+", default=["baseline_global", "full"])
     ap.add_argument("--max-df", type=int, default=1000)
-    ap.add_argument("--token-max-df", type=int, default=200)
+    ap.add_argument("--token-max-df", type=int, default=100)
     ap.add_argument("--addr-max-df", type=int, default=100)
     ap.add_argument("--pair-max-df", type=int, default=100)
     ap.add_argument("--chunk-size", type=int, default=20_000)
@@ -250,10 +265,13 @@ def main():
                 del strat.index
             continue
         report, miss_s1, miss_pool, elapsed = evaluate_blocking(
-            strategies, s1, pool.num_rows, gt_s1, gt_pool, args.chunk_size
+            strategies, s1, pool.num_rows, gt_s1, gt_pool, args.chunk_size,
+            comparison_space=same_country_space(s1, pool),
         )
         print(f"blocking {elapsed:.1f}s")
         print(format_report(report))
+        print("\nprecision view:")
+        print(precision_view(report))
         report.to_csv(OUT_DIR / f"report_{set_name}.tsv", sep="\t", index=False)
 
         miss = miss_breakdown(s1, pool, miss_s1, miss_pool, NORM)

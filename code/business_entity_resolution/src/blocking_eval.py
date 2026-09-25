@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from blocking import generate_candidates
+from metrics import macro_fbeta
 
 # index of the lowest set bit for every uint16 value (0 -> -1, unused)
 _LOWEST_BIT = np.array(
@@ -19,11 +20,14 @@ _LOWEST_BIT = np.array(
 )
 
 
-def evaluate_blocking(strategies, s1, n_pool, gt_s1_rows, gt_pool_rows, chunk_size=20_000):
+def evaluate_blocking(strategies, s1, n_pool, gt_s1_rows, gt_pool_rows, chunk_size=20_000,
+                      comparison_space=None):
     """Run blocking over ``s1`` and score it against ground-truth pairs.
 
     ``gt_s1_rows`` / ``gt_pool_rows`` are parallel arrays of true
     (s1_row, pool_row) pairs, as row indices into ``s1`` and the pool.
+    ``comparison_space`` is the number of pairs brute force would compare
+    (e.g. S1 x same-country pool); when given, the reduction ratio is reported.
     """
     n_s1, n_strat = s1.num_rows, len(strategies)
     gt_keys = np.sort(gt_s1_rows.astype(np.int64) * n_pool + gt_pool_rows)
@@ -64,6 +68,7 @@ def evaluate_blocking(strategies, s1, n_pool, gt_s1_rows, gt_pool_rows, chunk_si
     rows = []
     for k, strat in enumerate(strategies):
         cc = cum_counts[:, k]
+        cf = cum_found[:, k]
         rows.append({
             "strategy": ("" if k == 0 else "+ ") + strat.name,
             "recall": cum_found[:, k].sum() / n_gt,
@@ -74,10 +79,21 @@ def evaluate_blocking(strategies, s1, n_pool, gt_s1_rows, gt_pool_rows, chunk_si
             "p99": np.percentile(cc, 99),
             "max": cc.max(),
             "zero_cand_s1": (cc == 0).mean(),
+            # precision of the candidate set (pair quality): true / candidates
+            "pair_precision": cf.sum() / max(cc.sum(), 1),
+            # mean per-S1 precision over S1s that have candidates
+            "macro_precision": (cf[cc > 0] / cc[cc > 0]).mean() if (cc > 0).any() else 0.0,
+            # challenge metric if every candidate were predicted as a match
+            "macro_f05_all_cands": macro_fbeta(cc, cf, gt_per_s1),
+            "reduction_ratio": (
+                1 - cc.sum() / comparison_space if comparison_space else np.nan
+            ),
             "new_true": int(found[:, k].sum()),
             "new_pairs": int(counts[:, k].sum()),
+            "new_pair_precision": found[:, k].sum() / max(counts[:, k].sum(), 1),
             "solo_recall": solo_true[k] / n_gt,
             "solo_pairs": int(solo_pairs[k]),
+            "solo_precision": solo_true[k] / max(solo_pairs[k], 1),
             # leave-one-out: what removing only this strategy would lose
             "loo_recall_loss": only_true[k] / n_gt,
             "loo_pairs_saved": int(only_pairs[k]),
@@ -88,12 +104,21 @@ def evaluate_blocking(strategies, s1, n_pool, gt_s1_rows, gt_pool_rows, chunk_si
     return report, missed // n_pool, missed % n_pool, elapsed
 
 
-def format_report(report: pd.DataFrame) -> str:
+def format_report(report: pd.DataFrame, columns=None) -> str:
+    fmt = formatted_report(report)
+    return (fmt if columns is None else fmt[columns]).to_string(index=False)
+
+
+def formatted_report(report: pd.DataFrame) -> pd.DataFrame:
+    """Report with percentages / counts rendered as display strings."""
     fmt = report.copy()
-    for col in ("recall", "s1_fully_covered", "zero_cand_s1", "solo_recall", "loo_recall_loss"):
+    for col in ("recall", "s1_fully_covered", "zero_cand_s1", "solo_recall", "loo_recall_loss",
+                "pair_precision", "macro_precision", "new_pair_precision", "solo_precision"):
         fmt[col] = (fmt[col] * 100).map("{:.2f}%".format)
+    fmt["macro_f05_all_cands"] = fmt["macro_f05_all_cands"].map("{:.4f}".format)
+    fmt["reduction_ratio"] = fmt["reduction_ratio"].map("{:.6f}".format)
     fmt["avg_cands"] = fmt["avg_cands"].map("{:.1f}".format)
     for col in ("median", "p95", "p99", "max", "new_true", "new_pairs", "solo_pairs",
                 "loo_pairs_saved"):
         fmt[col] = fmt[col].map("{:,.0f}".format)
-    return fmt.to_string(index=False)
+    return fmt
