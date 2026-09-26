@@ -21,6 +21,9 @@ MARTS_DIR = DATA_DIR / "marts"
 
 OUTPUT_DIR = PROJECT_ROOT / "output"
 
+# learned by src/pipeline/run_stage2c_learn_translit_dict.py; used by blocking
+TRANSLIT_DICT_PATH = INTERMEDIATE_DIR / "translit_dict.json"
+
 SEED = 42
 
 # Sources for which raw files exist per split.
@@ -53,7 +56,7 @@ MATCHER_SAMPLE_FRACTION = 0.10
 MATCHER_SEED = SEED + 1
 MATCHER_DIR = MARTS_DIR / "matcher"
 # pairs processed per feature chunk
-PAIR_CHUNK_SIZE = 2_000_000
+PAIR_CHUNK_SIZE = 1_000_000  # smaller chunks keep the feature stages' peak memory down
 # strong_name_and_address_overlap = name_jaccard >= X and address_jaccard >= Y
 STRONG_NAME_JACCARD = 0.5
 STRONG_ADDRESS_JACCARD = 0.5

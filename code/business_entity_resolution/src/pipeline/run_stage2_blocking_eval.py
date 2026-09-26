@@ -25,18 +25,27 @@ import pyarrow.parquet as pq  # noqa: E402
 
 from blocking import (  # noqa: E402
     AddressNumberKeys,
+    AddressRarePairKeys,
+    NameAddressRareKeys,
     CoreNameKey,
     ExactKey,
     KeyBlock,
     NamePairKeys,
     SpacelessNameKey,
     TokenKeys,
+    block_to_disk,
+    iter_union,
 )
 from blocking_config import default_strategies  # noqa: E402
 from blocking_eval import evaluate_blocking, format_report  # noqa: E402
 from config import INTERMEDIATE_DIR, STAGING_DIR  # noqa: E402
 from normalize import consonant_skeleton, phonetic_skeleton  # noqa: E402
 from split import load_split  # noqa: E402
+from translit_dict import MappedPhonetic, TranslitMap  # noqa: E402
+
+from config import TRANSLIT_DICT_PATH  # noqa: E402
+
+ADDRESS = "business_address_translit"
 
 COLUMNS = [
     "entity_id",
@@ -48,6 +57,10 @@ COLUMNS = [
     "country",
 ]
 NORM, TRANSLIT = "business_name_norm", "business_name_translit"
+RAW_COLUMNS = ["business_name", "business_address"]
+# raw text is only needed for the missed-pair report, so the pool is loaded
+# without it (~1.5 GB) and it is read back afterwards
+POOL_COLUMNS = [c for c in COLUMNS if c not in RAW_COLUMNS]
 
 
 def strategy_sets(max_df, token_max_df, addr_max_df, pair_max_df):
@@ -104,7 +117,46 @@ def strategy_sets(max_df, token_max_df, addr_max_df, pair_max_df):
             KeyBlock(f"name_pair|country[{pair_max_df}]", NamePairKeys(NORM), pair_max_df),
             KeyBlock(f"spaceless_name|country[{max_df}]", SpacelessNameKey(TRANSLIT), max_df),
         ],
+        # production + every proposed addition, for incremental / leave-one-out
+        # measurement in one run (see blocking_v2_candidates below)
+        "blocking_v2_candidates": blocking_v2_candidates(token_max_df, max_df, addr_max_df,
+                                                         pair_max_df),
     }
+
+
+def blocking_v2_candidates(token_max_df, max_df, addr_max_df, pair_max_df):
+    """Current production strategies first, then the proposed additions.
+
+    Additions: word / word-pair keys on the accent-folded field, the learned
+    transliteration dictionary (core-name and word keys; only if
+    translit_dict.json exists), rarest-word address pairs and rarest name x
+    address word keys.
+    """
+    strategies = default_strategies(
+        token_max_df=token_max_df, core_max_df=max_df, addr_max_df=addr_max_df,
+        pair_max_df=pair_max_df, spaceless_max_df=max_df,
+    ) + [
+        KeyBlock(f"name_token_translit|country[{token_max_df}]", TokenKeys(TRANSLIT),
+                 token_max_df),
+        KeyBlock(f"name_pair_translit|country[{pair_max_df}]", NamePairKeys(TRANSLIT),
+                 pair_max_df),
+    ]
+    if TRANSLIT_DICT_PATH.exists():
+        tmap = TranslitMap.load(TRANSLIT_DICT_PATH)
+        strategies += [
+            KeyBlock(f"core_name_dict_phonetic|country[{max_df}]",
+                     CoreNameKey(TRANSLIT, transform=MappedPhonetic(tmap, phonetic_skeleton)),
+                     max_df),
+            KeyBlock(f"name_token_dict|country[{token_max_df}]",
+                     TokenKeys(TRANSLIT, transform=tmap), token_max_df),
+        ]
+    strategies += [
+        KeyBlock(f"addr_rare_pairs|country[{addr_max_df}]", AddressRarePairKeys(ADDRESS),
+                 addr_max_df),
+        KeyBlock(f"name_x_addr_rare|country[{addr_max_df}]",
+                 NameAddressRareKeys(TRANSLIT, ADDRESS), addr_max_df),
+    ]
+    return strategies
 
 
 OUT_DIR = INTERMEDIATE_DIR / "blocking"
@@ -116,7 +168,7 @@ def load_inputs():
     s1 = pq.read_table(STAGING_DIR / "train" / "s1.parquet", columns=COLUMNS)
     s1 = s1.filter(pc.is_in(s1["entity_id"], value_set=val_ids))
     pool = pa.concat_tables(
-        pq.read_table(STAGING_DIR / "train" / f"{s}.parquet", columns=COLUMNS)
+        pq.read_table(STAGING_DIR / "train" / f"{s}.parquet", columns=POOL_COLUMNS)
         for s in ("s2", "s3")
     ).combine_chunks()
 
@@ -148,7 +200,15 @@ def precision_view(report: pd.DataFrame) -> str:
 def miss_breakdown(s1, pool, miss_s1, miss_pool, field):
     """Why were true matches missed? Joins missed pairs back to their text."""
     a = s1.take(pa.array(miss_s1)).to_pandas()
-    b = pool.take(pa.array(miss_pool)).to_pandas()
+    raw = pa.concat_tables(  # same row order as the pool (S2 then S3)
+        pq.read_table(STAGING_DIR / "train" / f"{s}.parquet", columns=RAW_COLUMNS)
+        for s in ("s2", "s3")
+    )
+    b = pool.select([c for c in pool.column_names if c not in RAW_COLUMNS]).take(
+        pa.array(miss_pool)).to_pandas()
+    for col in RAW_COLUMNS:
+        b[col] = raw[col].take(pa.array(miss_pool)).to_numpy(zero_copy_only=False)
+    del raw
     df = pd.DataFrame({
         "s1_id": a["entity_id"], "s1_name": a["business_name"],
         "cand_id": b["entity_id"], "cand_name": b["business_name"],
@@ -235,22 +295,27 @@ def main():
     for set_name in args.sets:
         strategies = sets[set_name]
         print(f"\n=== {set_name}")
-        for strat in strategies:
-            t0 = time.time()
-            strat.fit(pool)
-            idx = strat.index
-            print(f"  fit {strat.name}: {time.time() - t0:.1f}s | kept "
-                  f"{len(idx.vocab):,}/{idx.n_keys_total:,} keys, "
-                  f"{len(idx.postings):,}/{idx.n_postings_total:,} postings")
         if args.sweep_target:
+            for strat in strategies:
+                t0 = time.time()
+                strat.fit(pool)
+                idx = strat.index
+                print(f"  fit {strat.name}: {time.time() - t0:.1f}s | kept "
+                      f"{len(idx.vocab):,}/{idx.n_keys_total:,} keys, "
+                      f"{len(idx.postings):,}/{idx.n_postings_total:,} postings")
             sweep_cap(strategies, args.sweep_target, args.sweep_caps,
                       s1, pool, gt_s1, gt_pool, args)
             for strat in strategies:
                 del strat.index
             continue
+        # low memory: one strategy index at a time, candidates via disk
+        workdir = OUT_DIR / "tmp_candidates"
+        block_to_disk(strategies, {"val": s1}, pool, workdir, args.chunk_size, log=print)
         report, miss_s1, miss_pool, elapsed = evaluate_blocking(
             strategies, s1, pool.num_rows, gt_s1, gt_pool, args.chunk_size,
             comparison_space=same_country_space(s1, pool),
+            candidates=iter_union("val", s1, pool.num_rows, len(strategies), workdir,
+                                  args.chunk_size),
         )
         print(f"blocking {elapsed:.1f}s")
         print(format_report(report))

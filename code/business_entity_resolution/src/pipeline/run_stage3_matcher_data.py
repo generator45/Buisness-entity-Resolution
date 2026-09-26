@@ -2,8 +2,9 @@
 
 1. Sample two disjoint ~10% sets of train S1 entities (split.py,
    ``make_matcher_split``): matcher_train and matcher_val.
-2. Run the production blocker (blocking_config.default_strategies) against
-   the full train S2/S3 pool, independently for each sample, and write every
+2. Run the production blocker (blocking_config.default_strategies, keeping
+   each S1's TOP_N candidates by key rarity) against the full train S2/S3
+   pool, independently for each sample, and write every
    (S1, candidate) pair with its ground-truth target to
    data/intermediate/matcher/<sample>_candidates.parquet. Only blocker
    candidates are kept: true matches the blocker missed are counted in the
@@ -15,9 +16,11 @@
 4. Validate the outputs and write data/marts/matcher/summary.json.
 
 Run from code/business_entity_resolution/:
-    python3 src/pipeline/run_stage3_matcher_data.py
+    python3 src/pipeline/run_stage3_matcher_data.py            # blocking + features
+    python3 src/pipeline/run_stage3_matcher_data.py --skip-blocking   # features only
 """
 
+import argparse
 import gc
 import json
 import sys
@@ -32,8 +35,8 @@ import pyarrow as pa  # noqa: E402
 import pyarrow.compute as pc  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
-from blocking import generate_candidates  # noqa: E402
-from blocking_config import BLOCKING_COLUMNS, default_strategies  # noqa: E402
+from blocking import block_to_disk, iter_union_top_n  # noqa: E402
+from blocking_config import BLOCKING_COLUMNS, TOP_N, default_strategies  # noqa: E402
 from config import (  # noqa: E402
     INTERMEDIATE_DIR,
     MATCHER_DIR,
@@ -95,8 +98,11 @@ def true_pairs(s1: pa.Table, pool: pa.Table):
 
 # ------------------------------------------------------ candidates + target
 
-def write_candidates(name, s1, s1_rows, pool, strategies):
-    """Block one sample and write (s1 row, pool row, target) pairs."""
+def write_candidates(name, s1, s1_rows, pool, candidates):
+    """Write one sample's blocking candidates as (s1 row, pool row, target).
+
+    ``candidates`` is the stream from blocking.iter_union / generate_candidates.
+    """
     gt_s1, gt_pool = true_pairs(s1, pool)
     n_pool = pool.num_rows
     gt_keys = np.sort(gt_s1.astype(np.int64) * n_pool + gt_pool)
@@ -104,7 +110,7 @@ def write_candidates(name, s1, s1_rows, pool, strategies):
     pos_per_s1 = np.zeros(s1.num_rows, np.int64)
     path = CANDIDATE_DIR / f"{name}_candidates.parquet"
     with ParquetChunkWriter(path) as writer:
-        for _, q, c, _ in generate_candidates(strategies, s1, n_pool):
+        for _, q, c, _ in candidates:
             target = np.isin(q * n_pool + c, gt_keys, assume_unique=True)
             cands_per_s1 += np.bincount(q, minlength=s1.num_rows)
             pos_per_s1 += np.bincount(q[target], minlength=s1.num_rows)
@@ -137,8 +143,9 @@ class FeatureChecks:
 
     def update(self, feats, target, pool_rows, source, n_s2):
         self.rows += len(target)
-        mat = np.column_stack([feats[c].astype(np.float64) for c in self.columns])
-        if not np.isfinite(mat).all():
+        # column by column: stacking every feature as float64 would cost
+        # ~0.6 GB per chunk
+        if not all(np.isfinite(feats[c]).all() for c in self.columns):
             self.problems.append("non-finite feature values")
         for c in self.binary:
             if not np.isin(feats[c], (0, 1)).all():
@@ -157,7 +164,7 @@ class FeatureChecks:
         self.country_mismatch += int((feats["country_exact_match"] == 0).sum())
         for t in (0, 1):
             sel = target == t
-            self.sums[t] += mat[sel].sum(axis=0)
+            self.sums[t] += [feats[c][sel].sum(dtype=np.float64) for c in self.columns]
             self.counts[t] += int(sel.sum())
 
     def means(self):
@@ -246,7 +253,26 @@ def validate_outputs(paths, summaries):
     return overlap, issues
 
 
+def candidate_stats(cand_path, s1, s1_rows, pool):
+    """Per-S1 counts (as returned by write_candidates) from a candidate file."""
+    cands = pq.read_table(cand_path, columns=["s1_row", "target"])
+    local = np.searchsorted(s1_rows, cands["s1_row"].to_numpy())
+    target = cands["target"].to_numpy().astype(bool)
+    gt_s1, _ = true_pairs(s1, pool)
+    return {
+        "cands_per_s1": np.bincount(local, minlength=s1.num_rows),
+        "pos_per_s1": np.bincount(local[target], minlength=s1.num_rows),
+        "gt_per_s1": np.bincount(gt_s1, minlength=s1.num_rows),
+    }
+
+
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--skip-blocking", action="store_true",
+                    help="reuse the candidate files from a previous run and only build "
+                         "features (runs the feature step in a fresh process, whose memory "
+                         "is not fragmented by the blocking indexes)")
+    args = ap.parse_args()
     t_start = time.time()
     split = load_matcher_split()
     samples = {n: set(split.loc[split["split"] == n, "entity_id"]) for n in SAMPLES}
@@ -260,19 +286,29 @@ def main():
     s1_tables = {n: load_s1_sample(ids) for n, ids in samples.items()}
     log(f"pool S2+S3: {pool.num_rows:,}")
 
-    # --- blocking: indexes built once, queried per sample
-    strategies = default_strategies()
-    for strat in strategies:
-        t0 = time.time()
-        strat.fit(pool)
-        log(f"fit {strat.name}: {time.time() - t0:.1f}s")
     cand_paths, stats = {}, {}
-    for name in SAMPLES:
-        s1, s1_rows = s1_tables[name]
-        cand_paths[name], stats[name] = write_candidates(name, s1, s1_rows, pool, strategies)
-        log(f"{name}: {int(stats[name]['cands_per_s1'].sum()):,} candidate pairs -> {cand_paths[name]}")
-    del strategies
-    gc.collect()
+    if args.skip_blocking:
+        for name in SAMPLES:
+            s1, s1_rows = s1_tables[name]
+            cand_paths[name] = CANDIDATE_DIR / f"{name}_candidates.parquet"
+            stats[name] = candidate_stats(cand_paths[name], s1, s1_rows, pool)
+            log(f"{name}: reusing {int(stats[name]['cands_per_s1'].sum()):,} candidate pairs")
+    else:
+        # --- blocking, low memory: one strategy index at a time, pairs via disk
+        strategies = default_strategies()
+        tmpdir = CANDIDATE_DIR / "tmp_blocking"
+        block_to_disk(strategies, {n: s1_tables[n][0] for n in SAMPLES}, pool, tmpdir,
+                      log=log, with_df=True)
+        caps = [s.max_df for s in strategies]
+        for name in SAMPLES:
+            s1, s1_rows = s1_tables[name]
+            # each S1 keeps its TOP_N candidates by key rarity (blocking_config)
+            candidates = iter_union_top_n(name, s1, pool.num_rows, caps, tmpdir, TOP_N)
+            cand_paths[name], stats[name] = write_candidates(name, s1, s1_rows, pool, candidates)
+            log(f"{name}: {int(stats[name]['cands_per_s1'].sum()):,} candidate pairs "
+                f"-> {cand_paths[name]}")
+        del strategies
+        gc.collect()
 
     # --- features: pool-side lookups built once, S1 side per sample
     t0 = time.time()

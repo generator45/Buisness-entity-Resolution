@@ -19,7 +19,7 @@ avoided: it turns the row indices into a Python list and copies the bins,
 which ran out of memory.)
 
 Run from code/business_entity_resolution/:
-    python3 src/pipeline/run_stage4b_tune_matcher.py [--version v3c]
+    python3 src/pipeline/run_stage4b_tune_matcher.py [--version v3c] [--configs leaves255]
 """
 
 import argparse
@@ -77,7 +77,11 @@ def holdout_cut(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", choices=sorted(VERSIONS), default="v3c")
-    version_name = ap.parse_args().version
+    ap.add_argument("--configs", nargs="+", choices=sorted(CONFIGS), default=sorted(CONFIGS),
+                    help="subset of CONFIGS to train (default: all)")
+    args = ap.parse_args()
+    version_name = args.version
+    configs = {k: CONFIGS[k] for k in args.configs}
     version = VERSIONS[version_name]
     features = [c for _, cols in version["sources"] for c in cols]
     model_name = f"matcher_{version_name}_tuned_lgbm"
@@ -104,7 +108,7 @@ def main():
     log("binned datasets built")
 
     results, models = [], {}
-    for name, params in CONFIGS.items():
+    for name, params in configs.items():
         t0 = time.time()
         model = lgb.train(
             params, fit_set, num_boost_round=MAX_ROUNDS,

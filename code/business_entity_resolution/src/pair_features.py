@@ -68,6 +68,9 @@ def _is_meaningful(token: str, stop) -> bool:
     return token not in stop and (len(token) > 1 or has_digit)
 
 
+BUILD_SLICE_ROWS = 1_000_000
+
+
 class TokenSets:
     """Distinct hashed tokens per record for one field, in CSR form.
 
@@ -84,39 +87,46 @@ class TokenSets:
 
     def __init__(self, table: pa.Table, field: str, transform=None, stop=frozenset(),
                  with_tokens=True, with_lookup=False, compute_idf=False, idf_from=None):
-        rows, codes, vocab = tokenize(table, field, transform)
-        tok_hash = _hash_strings(vocab)
-        meaningful = np.array([_is_meaningful(t, stop) for t in vocab], dtype=bool)
-        # distinct per record; a transform can map two raw tokens to one value
-        key = _mix(rows.astype(np.uint64), tok_hash[codes])
-        uniq, first = np.unique(key, return_index=True)
+        n = table.num_rows
+        # tokenize and dedupe per slice (a record never spans slices), so the
+        # large temporaries of a whole-table tokenization are never all alive
+        row_parts, tok_parts, mean_parts = [], [], []
+        for offset in range(0, n, BUILD_SLICE_ROWS):
+            rows, codes, vocab = tokenize(table.slice(offset, BUILD_SLICE_ROWS), field, transform)
+            tok_hash = _hash_strings(vocab)
+            meaningful = np.array([_is_meaningful(t, stop) for t in vocab], dtype=bool)
+            # distinct per record; a transform can map two raw tokens to one value
+            key = _mix(rows.astype(np.uint64), tok_hash[codes])
+            _, first = np.unique(key, return_index=True)
+            del key
+            first.sort()  # keep rows ascending for the CSR layout
+            row_parts.append((rows[first] + offset).astype(np.int64))
+            tok_parts.append(tok_hash[codes[first]])
+            mean_parts.append(meaningful[codes[first]])
+            del rows, codes, vocab, tok_hash, first
+        rows = np.concatenate(row_parts) if row_parts else np.zeros(0, np.int64)
+        th = np.concatenate(tok_parts) if tok_parts else np.zeros(0, np.uint64)
+        is_meaningful = np.concatenate(mean_parts) if mean_parts else np.zeros(0, bool)
+        del row_parts, tok_parts, mean_parts
         if with_lookup:
-            self.lookup = uniq  # np.unique output is already sorted
-        del uniq, key
-        first.sort()  # keep rows ascending for the CSR layout
-        rows, codes = rows[first], codes[first]
-        self.count = np.bincount(rows, minlength=table.num_rows).astype(np.int32)
-        is_meaningful = meaningful[codes]
-        self.meaningful_count = np.bincount(
-            rows[is_meaningful], minlength=table.num_rows
-        ).astype(np.int32)
+            self.lookup = _mix(rows.astype(np.uint64), th)
+            self.lookup.sort()
+        self.count = np.bincount(rows, minlength=n).astype(np.int32)
+        self.meaningful_count = np.bincount(rows[is_meaningful], minlength=n).astype(np.int32)
         token_idf = None
         if compute_idf:
-            th = tok_hash[codes]
             self.idf_vocab, df = np.unique(th, return_counts=True)
-            self.max_idf = float(np.log(table.num_rows))
-            self.idf_values = np.log(table.num_rows / df)
+            self.max_idf = float(np.log(n))
+            self.idf_values = np.log(n / df)
             token_idf = self.idf_values[np.searchsorted(self.idf_vocab, th)]
         elif idf_from is not None:
-            token_idf = idf_from.idf_of(tok_hash[codes])
+            token_idf = idf_from.idf_of(th)
             self.max_idf = idf_from.max_idf
         if token_idf is not None:
-            self.idf_sum = np.bincount(
-                rows, weights=token_idf * is_meaningful, minlength=table.num_rows
-            )
+            self.idf_sum = np.bincount(rows, weights=token_idf * is_meaningful, minlength=n)
         if with_tokens:
             self.offsets = np.r_[0, np.cumsum(self.count)]
-            self.tokens = tok_hash[codes]
+            self.tokens = th
             self.meaningful = is_meaningful
             if token_idf is not None:
                 self.token_idf = token_idf

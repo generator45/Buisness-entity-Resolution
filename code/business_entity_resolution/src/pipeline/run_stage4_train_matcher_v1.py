@@ -76,6 +76,11 @@ VERSIONS = {
     "v3c": {"model_name": "matcher_v3c_lgbm",
             "sources": [("_v2", V2_NOCOUNT_FEATURES), ("_v3a", V3A_COLUMNS),
                         ("_v3b", V3B_COLUMNS), ("_v3c", V3C_COLUMNS)]},
+    # the v3c feature set rebuilt on the v2 normalization + blocking
+    # (blocking_config: dictionary core key, rare address pairs, top-200)
+    "v4": {"model_name": "matcher_v4_lgbm",
+           "sources": [("_v2", V2_NOCOUNT_FEATURES), ("_v3a", V3A_COLUMNS),
+                       ("_v3b", V3B_COLUMNS), ("_v3c", V3C_COLUMNS)]},
 }
 # train-set metrics are computed on every TRAIN_METRIC_STEP-th row, so the full
 # training matrix never has to be held next to LightGBM's binned dataset

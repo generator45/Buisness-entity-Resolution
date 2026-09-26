@@ -21,13 +21,15 @@ _LOWEST_BIT = np.array(
 
 
 def evaluate_blocking(strategies, s1, n_pool, gt_s1_rows, gt_pool_rows, chunk_size=20_000,
-                      comparison_space=None):
+                      comparison_space=None, candidates=None):
     """Run blocking over ``s1`` and score it against ground-truth pairs.
 
     ``gt_s1_rows`` / ``gt_pool_rows`` are parallel arrays of true
     (s1_row, pool_row) pairs, as row indices into ``s1`` and the pool.
     ``comparison_space`` is the number of pairs brute force would compare
     (e.g. S1 x same-country pool); when given, the reduction ratio is reported.
+    ``candidates``: an already-computed candidate stream (e.g. iter_union);
+    by default the fitted ``strategies`` are queried in memory.
     """
     n_s1, n_strat = s1.num_rows, len(strategies)
     gt_keys = np.sort(gt_s1_rows.astype(np.int64) * n_pool + gt_pool_rows)
@@ -42,7 +44,9 @@ def evaluate_blocking(strategies, s1, n_pool, gt_s1_rows, gt_pool_rows, chunk_si
     hit_keys = []
 
     t0 = time.time()
-    for offset, q, c, bits in generate_candidates(strategies, s1, n_pool, chunk_size):
+    if candidates is None:
+        candidates = generate_candidates(strategies, s1, n_pool, chunk_size)
+    for offset, q, c, bits in candidates:
         lo, hi = offset * n_pool, (offset + chunk_size) * n_pool
         chunk_gt = gt_keys[np.searchsorted(gt_keys, lo):np.searchsorted(gt_keys, hi)]
         keys = q * n_pool + c

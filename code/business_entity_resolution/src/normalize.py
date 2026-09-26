@@ -62,16 +62,36 @@ ADDRESS_ABBREV_MAP = {
     "fl": "fl",
     "building": "bldg",
     "bldg": "bldg",
+    # French street types and their common abbreviations ("24 R Alexandre
+    # Ribot" vs "24 Rue Alexandre Ribot", "Av." / "Bd" / "Imp." / "Rte")
+    "rue": "rue",
+    "r": "rue",
+    "av": "ave",
+    "bd": "blvd",
+    "bld": "blvd",
+    "impasse": "impasse",
+    "imp": "impasse",
+    "route": "route",
+    "rte": "route",
+    "chemin": "chemin",
+    "ch": "chemin",
+    "faubourg": "faubourg",
+    "fg": "faubourg",
+    "square": "square",
+    "sq": "square",
 }
 
 # Tokens that carry no identity: canonical legal forms (post LEGAL_SUFFIX_MAP),
-# their French equivalents, and the most frequent unidecode spellings of
+# their French equivalents ("Cie", "Ets", "Société"), articles / connectives
+# in English and French, and the most frequent unidecode spellings of
 # "Private Limited" / "LLP" produced from Indic scripts (e.g. "प्राइवेट
 # लिमिटेड" -> "praaivett limittedd", "प्रा. लि." -> "praa li"). Dropped when
 # building the order-independent "core name" key.
 LEGAL_FORM_TOKENS = frozenset({
     "corp", "inc", "ltd", "llc", "llp", "pvt", "plc", "co", "lp", "the", "and",
     "of", "limited", "private", "sa", "sas", "sasu", "sarl", "sci", "eurl", "snc",
+    "cie", "ets", "etablissements", "societe", "ste",
+    "de", "du", "des", "la", "le", "les", "l", "d", "et",
     "limittedd", "limittett", "limirrrrdd", "praaivett", "praiveett",
     "piraiveett", "praaibhett", "praivrrrr", "praa", "li", "elelpii",
 })
@@ -87,12 +107,15 @@ WEB_TOKENS = frozenset({"www", "com", "net", "org", "http", "https"})
 # "meaningful" address tokens for pairwise features.
 ADDRESS_STOP_TOKENS = frozenset(set(ADDRESS_ABBREV_MAP.values()) | {
     "no", "near", "nr", "opp", "and", "the", "of", "po", "na",
+    # French articles and numbering filler ("52 bis", "Nº 17" -> "ndeg 17")
+    "de", "du", "des", "la", "le", "les", "l", "d", "bis", "ter", "ndeg",
 })
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _REPEAT_RE = re.compile(r"(.)\1+")
 _VOWELS_RE = re.compile(r"[aeiouy]")
 _DIGIT_RUN_RE = re.compile(r"\d+")
+_ORDINAL_RE = re.compile(r"^0*(\d+)(st|nd|rd|th)$")
 
 # Consonant clusters that transliteration spells inconsistently (aspirates,
 # sibilants, w/v, z/j, x/ks), plus the anusvara n/m before labials
@@ -150,6 +173,28 @@ def clean_punctuation(text: str) -> str:
     return text
 
 
+def join_single_letters(text: str) -> str:
+    """Join runs of two or more single-letter tokens into one token.
+
+    Dotted abbreviations lose their dots in punctuation cleanup and would
+    otherwise split into letters: "S.C.I." -> "s c i" -> "sci", "L.L.C." ->
+    "llc", "G.F.-12" -> "gf 12". Single letters between longer tokens are
+    left alone.
+    """
+    out, run = [], []
+    for tok in text.split(" "):
+        if len(tok) == 1 and tok.isalpha():
+            run.append(tok)
+            continue
+        if run:
+            out.append("".join(run) if len(run) > 1 else run[0])
+            run = []
+        out.append(tok)
+    if run:
+        out.append("".join(run) if len(run) > 1 else run[0])
+    return " ".join(t for t in out if t)
+
+
 def _collapse_tokens(text: str, synonym_map: dict) -> str:
     tokens = text.split(" ")
     collapsed = [synonym_map.get(tok, tok) for tok in tokens]
@@ -161,6 +206,7 @@ def normalize_business_name(raw_name) -> str:
     text = _as_text(raw_name)
     text = nfkc_casefold(text)
     text = clean_punctuation(text)
+    text = join_single_letters(text)
     text = _collapse_tokens(text, LEGAL_SUFFIX_MAP)
     return text
 
@@ -170,6 +216,7 @@ def normalize_business_address(raw_address) -> str:
     text = _as_text(raw_address)
     text = nfkc_casefold(text)
     text = clean_punctuation(text)
+    text = join_single_letters(text)
     text = _collapse_tokens(text, ADDRESS_ABBREV_MAP)
     return text
 
@@ -195,6 +242,7 @@ def transliterate_business_name(raw_name) -> str:
     text = unidecode(text)
     text = nfkc_casefold(text)
     text = clean_punctuation(text)
+    text = join_single_letters(text)
     text = _collapse_tokens(text, LEGAL_SUFFIX_MAP)
     return text
 
@@ -205,6 +253,7 @@ def transliterate_business_address(raw_address) -> str:
     text = unidecode(text)
     text = nfkc_casefold(text)
     text = clean_punctuation(text)
+    text = join_single_letters(text)
     text = _collapse_tokens(text, ADDRESS_ABBREV_MAP)
     return text
 
@@ -248,8 +297,13 @@ def normalize_house_number(token: str) -> str:
     """Canonical form of a numeric address token, or "" if it has no digits.
 
     Keeps the first digit run and strips leading zeros, so "05204" -> "5204",
-    "002610" -> "2610", "2609c" -> "2609", "23rd" / "23nd" -> "23".
+    "002610" -> "2610", "2609c" -> "2609". Ordinals keep a marker so a street
+    like "23rd" does not collide with house number 23, while ordinal typos
+    still agree: "23rd" / "23nd" / "023rd" -> "23o".
     """
+    ordinal = _ORDINAL_RE.match(token)
+    if ordinal:
+        return (ordinal.group(1).lstrip("0") or "0") + "o"
     m = _DIGIT_RUN_RE.search(token)
     if m is None:
         return ""

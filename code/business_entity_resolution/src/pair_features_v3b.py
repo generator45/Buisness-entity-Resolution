@@ -63,7 +63,9 @@ class NumberLists:
         self.strings = strings.astype(object)
         self.length = np.array([len(s) for s in strings], dtype=np.int64)
         self.value = np.array(
-            [int(s) if 0 < len(s) <= MAX_EXACT_DIGITS else -1 for s in strings], dtype=np.int64
+            # ordinals ("23o") and very long numbers skip numeric comparisons
+            [int(s) if s.isdigit() and len(s) <= MAX_EXACT_DIGITS else -1 for s in strings],
+            dtype=np.int64,
         )
 
 

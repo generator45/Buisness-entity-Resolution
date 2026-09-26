@@ -96,9 +96,10 @@ class Checks:
 
     def update(self, feats, target):
         self.rows += len(target)
-        mat = np.column_stack([feats[c].astype(np.float64) for c in self.columns])
-        if not np.isfinite(mat).all():
-            self.problems.append("non-finite values")
+        # column by column: stacking every feature as float64 would cost
+        # ~0.6 GB per chunk
+        if not all(np.isfinite(feats[c]).all() for c in self.columns):
+            self.problems.append("non-finite feature values")
         for c in self.binary:
             if not np.isin(feats[c], (0, 1)).all():
                 self.problems.append(f"{c} not binary")
@@ -108,7 +109,7 @@ class Checks:
                 self.problems.append(f"{c} outside [{lo}, {hi}]")
         for t in (0, 1):
             sel = target == t
-            self.sums[t] += mat[sel].sum(axis=0)
+            self.sums[t] += [feats[c][sel].sum(dtype=np.float64) for c in self.columns]
             self.counts[t] += int(sel.sum())
 
     def means(self):
