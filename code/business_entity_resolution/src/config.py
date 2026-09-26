@@ -57,3 +57,6 @@ PAIR_CHUNK_SIZE = 2_000_000
 # strong_name_and_address_overlap = name_jaccard >= X and address_jaccard >= Y
 STRONG_NAME_JACCARD = 0.5
 STRONG_ADDRESS_JACCARD = 0.5
+
+# --- matcher models (stage 4) ---
+MODELS_DIR = DATA_DIR / "models"
