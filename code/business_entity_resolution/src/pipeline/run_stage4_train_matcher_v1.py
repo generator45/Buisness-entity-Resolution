@@ -24,7 +24,7 @@ the row-aligned V3a add-on files; outputs are written as <model_name>* files.
 Train-set metrics are computed on every 4th training row.
 
 Run from code/business_entity_resolution/:
-    python3 src/pipeline/run_stage4_train_matcher_v1.py [--version v2|v2_nocount|v3a]
+    python3 src/pipeline/run_stage4_train_matcher_v1.py [--version v2|v2_nocount|v3a|v3b|v3c]
 """
 
 import argparse
@@ -43,11 +43,13 @@ import pyarrow.compute as pc  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 from sklearn.metrics import average_precision_score, roc_auc_score  # noqa: E402
 
-from config import MATCHER_DIR, MODELS_DIR, SEED, STAGING_DIR  # noqa: E402
+from config import INTERMEDIATE_DIR, MATCHER_DIR, MODELS_DIR, SEED, STAGING_DIR  # noqa: E402
 from metrics import per_entity_fbeta  # noqa: E402
 from pair_features import FEATURE_COLUMNS  # noqa: E402
 from pair_features_v2 import V2_FEATURE_COLUMNS  # noqa: E402
 from pair_features_v3a import V3A_COLUMNS  # noqa: E402
+from pair_features_v3b import V3B_COLUMNS  # noqa: E402
+from pair_features_v3c import V3C_COLUMNS  # noqa: E402
 from split import load_matcher_split  # noqa: E402
 
 # V1 features with zero gain in the V1 model: country is constant (blocking
@@ -66,11 +68,21 @@ VERSIONS = {
     # v2_nocount + the V3a add-on features (India error modes)
     "v3a": {"model_name": "matcher_v3a_lgbm",
             "sources": [("_v2", V2_NOCOUNT_FEATURES), ("_v3a", V3A_COLUMNS)]},
+    # v3a + house-number closeness and name distinctiveness (V3b add-on)
+    "v3b": {"model_name": "matcher_v3b_lgbm",
+            "sources": [("_v2", V2_NOCOUNT_FEATURES), ("_v3a", V3A_COLUMNS),
+                        ("_v3b", V3B_COLUMNS)]},
+    # v3b + address distinctiveness (V3c add-on)
+    "v3c": {"model_name": "matcher_v3c_lgbm",
+            "sources": [("_v2", V2_NOCOUNT_FEATURES), ("_v3a", V3A_COLUMNS),
+                        ("_v3b", V3B_COLUMNS), ("_v3c", V3C_COLUMNS)]},
 }
 # train-set metrics are computed on every TRAIN_METRIC_STEP-th row, so the full
 # training matrix never has to be held next to LightGBM's binned dataset
 TRAIN_METRIC_STEP = 4
 PREDICT_CHUNK = 5_000_000
+# memory-mapped feature matrices (deleted after each run)
+MATRIX_DIR = INTERMEDIATE_DIR / "matrices"
 # LightGBM defaults, made explicit; only seeds / determinism added.
 PARAMS = {
     "objective": "binary",
@@ -91,18 +103,25 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def load_xy(sources, extra_columns=(), row_step=1):
+def load_xy(sources, extra_columns=(), row_step=1, memmap_path=None):
     """Feature matrix, target and optional extra columns.
 
     ``sources`` is a list of (path, columns) of row-aligned pairs files whose
     columns are placed side by side; their targets must agree row for row.
     With ``row_step`` > 1 only rows whose global index is a multiple of it
     are kept. The float32 matrix is filled batch by batch so a full Arrow
-    table is never held alongside it.
+    table is never held alongside it. With ``memmap_path`` the matrix lives
+    in a memory-mapped .npy file instead of RAM (file-backed pages the OS can
+    evict), returned read-only.
     """
     n = pq.ParquetFile(sources[0][0]).metadata.num_rows
     keep = -(-n // row_step)
-    x = np.empty((keep, sum(len(cols) for _, cols in sources)), dtype=np.float32)
+    shape = (keep, sum(len(cols) for _, cols in sources))
+    if memmap_path is not None:
+        Path(memmap_path).parent.mkdir(parents=True, exist_ok=True)
+        x = np.lib.format.open_memmap(memmap_path, mode="w+", dtype=np.float32, shape=shape)
+    else:
+        x = np.empty(shape, dtype=np.float32)
     y, col0 = None, 0
     for path, cols in sources:
         pf = pq.ParquetFile(path)
@@ -122,6 +141,10 @@ def load_xy(sources, extra_columns=(), row_step=1):
         elif not np.array_equal(y, ys):
             raise ValueError(f"{path} is not row-aligned with {sources[0][0]}")
         col0 += len(cols)
+    if memmap_path is not None:
+        x.flush()
+        del x
+        x = np.load(memmap_path, mmap_mode="r")
     extra = pq.read_table(sources[0][0], columns=list(extra_columns)) if extra_columns else None
     return x, y, extra
 
@@ -203,12 +226,14 @@ def main():
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------ train
-    x, y, _ = load_xy(sources("train"))
+    train_matrix = MATRIX_DIR / f"{model_name}_train_x.npy"
+    x, y, _ = load_xy(sources("train"), memmap_path=train_matrix)
     log(f"train: {len(y):,} pairs, {int(y.sum()):,} positive ({y.mean():.4%}), "
         f"{len(features)} features")
     train_set = lgb.Dataset(x, label=y, feature_name=features, free_raw_data=True)
     train_set.construct()
     del x, y  # LightGBM keeps its own binned copy
+    train_matrix.unlink()
     t0 = time.time()
     model = lgb.train(PARAMS, train_set, num_boost_round=NUM_BOOST_ROUND)
     log(f"trained {NUM_BOOST_ROUND} rounds in {time.time() - t0:.1f}s")
@@ -224,14 +249,23 @@ def main():
     model_path = MODELS_DIR / f"{model_name}.txt"
     model.save_model(str(model_path))
 
-    # ------------------------------------------------------- validation
-    xv, yv, ids = load_xy(
-        sources("val"), extra_columns=("source1_entity_id", "candidate_entity_id"),
-    )
+    evaluate_on_val(model, model_name, features, sources("val"), {
+        "model": str(model_path), "params": PARAMS, "num_boost_round": NUM_BOOST_ROUND,
+        "train": train_scores,
+    }, t_start)
+
+
+def evaluate_on_val(model, model_name, features, val_sources, report_base, t_start):
+    """Score the validation pairs, write predictions / sweep / report, print."""
+    val_matrix = MATRIX_DIR / f"{model_name}_val_x.npy"
+    xv, yv, _ = load_xy(val_sources, memmap_path=val_matrix)
     t0 = time.time()
     prob = predict_chunked(model, xv)
     log(f"scored {len(yv):,} validation pairs in {time.time() - t0:.1f}s")
     del xv
+    val_matrix.unlink()
+    # IDs are read only after the feature matrix is freed (memory)
+    ids = pq.read_table(val_sources[0][0], columns=["source1_entity_id", "candidate_entity_id"])
     pred_path = MODELS_DIR / f"{model_name}_val_predictions.parquet"
     pq.write_table(
         ids.append_column("target", pa.array(yv))
@@ -267,9 +301,7 @@ def main():
     }).sort_values("gain", ascending=False)
 
     report = {
-        "model": str(model_path),
-        "params": PARAMS,
-        "num_boost_round": NUM_BOOST_ROUND,
+        **report_base,
         "features": features,
         "validation": {
             "candidate_pairs": int(len(yv)),
@@ -285,7 +317,6 @@ def main():
             "optimal_f0_5": f_opt,
             "challenge_macro_f0_5_at_optimal": macro_opt,
         },
-        "train": train_scores,
         "threshold_sweep": sweep.to_dict(orient="records"),
         "feature_importance": importance.to_dict(orient="records"),
         "predictions": str(pred_path),
@@ -294,11 +325,11 @@ def main():
     with open(MODELS_DIR / f"{model_name}_report.json", "w") as f:
         json.dump(report, f, indent=2)
 
-    v = report["validation"]
+    v, tr = report["validation"], report["train"]
     print(f"\nvalidation pairs: {v['candidate_pairs']:,} | positives: {v['positive_pairs']:,} "
           f"| positive rate: {v['positive_rate']:.4%}")
     print(f"PR-AUC (AP): {ap:.4f} | ROC-AUC: {roc:.4f} "
-          f"(train AP {train_scores['average_precision']:.4f}, ROC {train_scores['roc_auc']:.4f})")
+          f"(train AP {tr['average_precision']:.4f}, ROC {tr['roc_auc']:.4f})")
     print("\n" + sweep.to_string(index=False, float_format=lambda z: f"{z:.4f}"))
     print(f"\nbest sweep threshold: {best_sweep['threshold']:.2f} -> F0.5 {best_sweep['f0_5']:.4f}")
     print(f"exact optimum: threshold {t_opt:.4f} -> P {p_opt:.4f} R {r_opt:.4f} "
@@ -306,6 +337,7 @@ def main():
     print("\nfeature importance:\n" + importance.to_string(
         index=False, float_format=lambda z: f"{z:,.4f}"))
     log(f"done in {time.time() - t_start:.0f}s -> {MODELS_DIR}")
+    return report
 
 
 if __name__ == "__main__":

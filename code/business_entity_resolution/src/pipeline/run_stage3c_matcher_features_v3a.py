@@ -1,18 +1,21 @@
-"""Stage 3c: V3a add-on features, row-aligned with the V2 datasets.
+"""Stage 3c: add-on feature files, row-aligned with the V2 datasets.
 
 For each matcher sample, reads the stage-3 candidate pairs in S1-aligned
-chunks (the same order stage 3b wrote the V2 file), takes the V2 inputs it
-needs from <sample>_pairs_v2.parquet, computes pair_features_v3a.V3A_COLUMNS
-and writes data/marts/matcher/<sample>_pairs_v3a.parquet (features + target).
+chunks (the same order stage 3b wrote the V2 file), takes any V2 inputs the
+add-on needs from <sample>_pairs_v2.parquet, computes the add-on's features
+and writes data/marts/matcher/<sample>_pairs_<addon>.parquet (features +
+target). Add-ons (see ADDONS): v3a (pair_features_v3a), v3b
+(pair_features_v3b), v3c (pair_features_v3c).
 
 Row alignment with the V2 file is verified on every row: S1 and candidate
 IDs recomputed from the candidate pairs must equal the V2 file's IDs, and the
-targets must agree. Training joins the two files by row position.
+targets must agree. Training joins the files by row position.
 
 Run from code/business_entity_resolution/ after stage 3b:
-    python3 src/pipeline/run_stage3c_matcher_features_v3a.py
+    python3 src/pipeline/run_stage3c_matcher_features_v3a.py [--addon v3b|v3c]
 """
 
+import argparse
 import json
 import sys
 import time
@@ -34,39 +37,75 @@ from pair_features_v3a import (  # noqa: E402
     RAW_ADDRESS,
     RAW_NAME,
     V2_INPUTS,
-    V3A_BINARY,
-    V3A_COLUMNS,
+    V3A_DTYPES,
     V3A_UNIT_INTERVAL,
     FieldIndexV3a,
     compute_features_v3a,
+)
+from pair_features_v3b import (  # noqa: E402
+    V3B_DTYPES,
+    V3B_INPUTS,
+    FieldIndexV3b,
+    compute_features_v3b,
+)
+from pair_features_v3c import (  # noqa: E402
+    V3C_DTYPES,
+    V3C_INPUTS,
+    FieldIndexV3c,
+    compute_features_v3c,
 )
 from run_stage3_matcher_data import CANDIDATE_DIR, SAMPLES, load_pool, load_s1_sample, log  # noqa: E402
 from run_stage3b_matcher_features_v2 import aligned_chunks  # noqa: E402
 from split import load_matcher_split  # noqa: E402
 
-SUFFIX = "v3a"
-COLUMNS = ["entity_id", RAW_NAME, RAW_ADDRESS, NAME_FIELD, ADDRESS_FIELD]
+ADDONS = {
+    "v3a": {
+        "index": FieldIndexV3a, "compute": compute_features_v3a, "v2_inputs": V2_INPUTS,
+        "dtypes": V3A_DTYPES,
+        "columns": ["entity_id", RAW_NAME, RAW_ADDRESS, NAME_FIELD, ADDRESS_FIELD],
+        "ranges": {**{c: (0.0, 1.0) for c in V3A_UNIT_INTERVAL}, "name_rank_in_s1": (1, None)},
+    },
+    "v3b": {
+        "index": FieldIndexV3b, "compute": compute_features_v3b, "v2_inputs": V3B_INPUTS,
+        "dtypes": V3B_DTYPES,
+        "columns": ["entity_id", NAME_FIELD, ADDRESS_FIELD],
+        "ranges": {"address_number_min_edit": (-1, None),
+                   "address_number_min_rel_diff": (-1.0, 1.0),
+                   "name_s1_idf_sum": (0.0, None), "name_cand_idf_sum": (0.0, None),
+                   "name_shared_idf_sum": (0.0, None)},
+    },
+    "v3c": {
+        "index": FieldIndexV3c, "compute": compute_features_v3c, "v2_inputs": V3C_INPUTS,
+        "dtypes": V3C_DTYPES,
+        "columns": ["entity_id", NAME_FIELD, ADDRESS_FIELD],
+        "ranges": {"cand_address_key_idf": (-1.0, 1.0), "s1_address_key_idf": (-1.0, 1.0),
+                   "cand_address_distinct_names": (-1.0, None),
+                   "s1_address_distinct_names": (-1.0, None)},
+    },
+}
 
 
 class Checks:
-    def __init__(self):
+    def __init__(self, dtypes, ranges):
+        self.columns = list(dtypes)
+        self.binary = [c for c, t in dtypes.items() if t == np.int8]
+        self.ranges = ranges
         self.rows, self.problems = 0, []
-        self.sums = {t: np.zeros(len(V3A_COLUMNS)) for t in (0, 1)}
+        self.sums = {t: np.zeros(len(self.columns)) for t in (0, 1)}
         self.counts = {0: 0, 1: 0}
 
     def update(self, feats, target):
         self.rows += len(target)
-        mat = np.column_stack([feats[c].astype(np.float64) for c in V3A_COLUMNS])
+        mat = np.column_stack([feats[c].astype(np.float64) for c in self.columns])
         if not np.isfinite(mat).all():
             self.problems.append("non-finite values")
-        for c in V3A_BINARY:
+        for c in self.binary:
             if not np.isin(feats[c], (0, 1)).all():
                 self.problems.append(f"{c} not binary")
-        for c in V3A_UNIT_INTERVAL:
-            if ((feats[c] < 0) | (feats[c] > 1 + 1e-6)).any():
-                self.problems.append(f"{c} outside [0, 1]")
-        if (feats["name_rank_in_s1"] < 1).any():
-            self.problems.append("name_rank_in_s1 < 1")
+        for c, (lo, hi) in self.ranges.items():
+            v = feats[c]
+            if (lo is not None and (v < lo - 1e-6).any()) or (hi is not None and (v > hi + 1e-6).any()):
+                self.problems.append(f"{c} outside [{lo}, {hi}]")
         for t in (0, 1):
             sel = target == t
             self.sums[t] += mat[sel].sum(axis=0)
@@ -74,20 +113,21 @@ class Checks:
 
     def means(self):
         return {c: {f"mean_target_{t}": self.sums[t][i] / max(self.counts[t], 1) for t in (1, 0)}
-                for i, c in enumerate(V3A_COLUMNS)}
+                for i, c in enumerate(self.columns)}
 
 
-def build(name, ids, pool, pool_index):
-    s1, s1_rows = load_s1_sample(ids, COLUMNS)
-    s1_index = FieldIndexV3a(s1, "s1", pool_index)
+def build(name, suffix, spec, ids, pool, pool_index):
+    s1, s1_rows = load_s1_sample(ids, spec["columns"])
+    s1_index = spec["index"](s1, "s1", pool_index)
     cands = pq.read_table(CANDIDATE_DIR / f"{name}_candidates.parquet")
     v2 = pq.read_table(MATCHER_DIR / f"{name}_pairs_v2.parquet",
-                       columns=["source1_entity_id", "candidate_entity_id", "target", *V2_INPUTS])
+                       columns=["source1_entity_id", "candidate_entity_id", "target",
+                                *spec["v2_inputs"]])
     if v2.num_rows != cands.num_rows:
         raise ValueError(f"{name}: V2 file has {v2.num_rows} rows, candidates {cands.num_rows}")
     chunks = list(aligned_chunks(cands["s1_row"].to_numpy(), PAIR_CHUNK_SIZE))
-    checks = Checks()
-    out_path = MATCHER_DIR / f"{name}_pairs_{SUFFIX}.parquet"
+    checks = Checks(spec["dtypes"], spec["ranges"])
+    out_path = MATCHER_DIR / f"{name}_pairs_{suffix}.parquet"
     with ParquetChunkWriter(out_path) as writer:
         for i, (start, end) in enumerate(chunks):
             batch = cands.slice(start, end - start)
@@ -105,8 +145,8 @@ def build(name, ids, pool, pool_index):
             )
             if not same:
                 raise ValueError(f"{name}: chunk {i} is not row-aligned with the V2 file")
-            v2_in = {c: v2_batch[c].to_numpy() for c in V2_INPUTS}
-            feats = compute_features_v3a(s1_index, pool_index, qa, qb, v2_in)
+            v2_in = {c: v2_batch[c].to_numpy() for c in spec["v2_inputs"]}
+            feats = spec["compute"](s1_index, pool_index, qa, qb, v2_in)
             writer.write(pa.table({**{c: pa.array(v) for c, v in feats.items()},
                                    "target": pa.array(target)}))
             checks.update(feats, target)
@@ -115,21 +155,25 @@ def build(name, ids, pool, pool_index):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--addon", choices=sorted(ADDONS), default="v3a")
+    suffix = ap.parse_args().addon
+    spec = ADDONS[suffix]
     t_start = time.time()
     split = load_matcher_split()
-    pool, _ = load_pool(COLUMNS)
+    pool, _ = load_pool(spec["columns"])
     t0 = time.time()
-    pool_index = FieldIndexV3a(pool, "pool")
-    log(f"pool V3a index built in {time.time() - t0:.1f}s")
+    pool_index = spec["index"](pool, "pool")
+    log(f"pool {suffix} index built in {time.time() - t0:.1f}s")
     summary = {}
     for name in SAMPLES:
         ids = set(split.loc[split["split"] == name, "entity_id"])
-        path, checks = build(name, ids, pool, pool_index)
+        path, checks = build(name, suffix, spec, ids, pool, pool_index)
         summary[name] = {"output": str(path), "rows": checks.rows, "aligned_with_v2": True,
                          "problems": sorted(set(checks.problems)),
                          "feature_means_by_target": checks.means()}
     summary["runtime_seconds"] = round(time.time() - t_start, 1)
-    with open(MATCHER_DIR / f"summary_{SUFFIX}.json", "w") as f:
+    with open(MATCHER_DIR / f"summary_{suffix}.json", "w") as f:
         json.dump(summary, f, indent=2)
     for name in SAMPLES:
         print(f"{name}: {summary[name]['rows']:,} rows, aligned with V2, "
