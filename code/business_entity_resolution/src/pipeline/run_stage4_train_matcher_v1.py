@@ -18,10 +18,16 @@ Writes to data/models/: the model (matcher_v1_lgbm.txt), validation
 probabilities (matcher_v1_val_predictions.parquet), the sweep table and a
 JSON report. Test data is not touched.
 
+``--version`` picks the feature set (see VERSIONS): v2 / v2_nocount train
+the same model (same parameters) on the V2 datasets, v3a additionally joins
+the row-aligned V3a add-on files; outputs are written as <model_name>* files.
+Train-set metrics are computed on every 4th training row.
+
 Run from code/business_entity_resolution/:
-    python3 src/pipeline/run_stage4_train_matcher_v1.py
+    python3 src/pipeline/run_stage4_train_matcher_v1.py [--version v2|v2_nocount|v3a]
 """
 
+import argparse
 import json
 import sys
 import time
@@ -40,9 +46,31 @@ from sklearn.metrics import average_precision_score, roc_auc_score  # noqa: E402
 from config import MATCHER_DIR, MODELS_DIR, SEED, STAGING_DIR  # noqa: E402
 from metrics import per_entity_fbeta  # noqa: E402
 from pair_features import FEATURE_COLUMNS  # noqa: E402
+from pair_features_v2 import V2_FEATURE_COLUMNS  # noqa: E402
+from pair_features_v3a import V3A_COLUMNS  # noqa: E402
 from split import load_matcher_split  # noqa: E402
 
-MODEL_NAME = "matcher_v1_lgbm"
+# V1 features with zero gain in the V1 model: country is constant (blocking
+# is country-scoped) and the exact-match flags are implied by Jaccard == 1.
+DROPPED_IN_V2 = {"country_exact_match", "address_exact_match", "name_and_address_exact_match"}
+V2_MODEL_FEATURES = [c for c in V2_FEATURE_COLUMNS if c not in DROPPED_IN_V2]
+V2_NOCOUNT_FEATURES = [c for c in V2_MODEL_FEATURES if c != "s1_candidate_count"]
+# each version: the model name and its feature sources, as (dataset suffix,
+# columns) pairs; several sources are row-aligned files joined by position
+VERSIONS = {
+    "v1": {"model_name": "matcher_v1_lgbm", "sources": [("", FEATURE_COLUMNS)]},
+    "v2": {"model_name": "matcher_v2_lgbm", "sources": [("_v2", V2_MODEL_FEATURES)]},
+    # ablation: V2 without the pool-size-dependent candidate-count prior
+    "v2_nocount": {"model_name": "matcher_v2_nocount_lgbm",
+                   "sources": [("_v2", V2_NOCOUNT_FEATURES)]},
+    # v2_nocount + the V3a add-on features (India error modes)
+    "v3a": {"model_name": "matcher_v3a_lgbm",
+            "sources": [("_v2", V2_NOCOUNT_FEATURES), ("_v3a", V3A_COLUMNS)]},
+}
+# train-set metrics are computed on every TRAIN_METRIC_STEP-th row, so the full
+# training matrix never has to be held next to LightGBM's binned dataset
+TRAIN_METRIC_STEP = 4
+PREDICT_CHUNK = 5_000_000
 # LightGBM defaults, made explicit; only seeds / determinism added.
 PARAMS = {
     "objective": "binary",
@@ -63,13 +91,46 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def load_xy(path, extra_columns=()):
-    tbl = pq.read_table(path, columns=[*extra_columns, *FEATURE_COLUMNS, "target"])
-    x = np.empty((tbl.num_rows, len(FEATURE_COLUMNS)), dtype=np.float32)
-    for j, col in enumerate(FEATURE_COLUMNS):
-        x[:, j] = tbl[col].to_numpy()
-    y = tbl["target"].to_numpy().astype(np.int8)
-    return x, y, tbl.select(list(extra_columns))
+def load_xy(sources, extra_columns=(), row_step=1):
+    """Feature matrix, target and optional extra columns.
+
+    ``sources`` is a list of (path, columns) of row-aligned pairs files whose
+    columns are placed side by side; their targets must agree row for row.
+    With ``row_step`` > 1 only rows whose global index is a multiple of it
+    are kept. The float32 matrix is filled batch by batch so a full Arrow
+    table is never held alongside it.
+    """
+    n = pq.ParquetFile(sources[0][0]).metadata.num_rows
+    keep = -(-n // row_step)
+    x = np.empty((keep, sum(len(cols) for _, cols in sources)), dtype=np.float32)
+    y, col0 = None, 0
+    for path, cols in sources:
+        pf = pq.ParquetFile(path)
+        if pf.metadata.num_rows != n:
+            raise ValueError(f"{path} has {pf.metadata.num_rows} rows, expected {n}")
+        ys, start = np.empty(keep, dtype=np.int8), 0
+        for batch in pf.iter_batches(batch_size=2_000_000, columns=[*cols, "target"]):
+            sel = slice((-start) % row_step, None, row_step)
+            out = -(-start // row_step)
+            target = batch["target"].to_numpy()[sel]
+            for j, col in enumerate(cols):
+                x[out:out + len(target), col0 + j] = batch[col].to_numpy()[sel]
+            ys[out:out + len(target)] = target
+            start += batch.num_rows
+        if y is None:
+            y = ys
+        elif not np.array_equal(y, ys):
+            raise ValueError(f"{path} is not row-aligned with {sources[0][0]}")
+        col0 += len(cols)
+    extra = pq.read_table(sources[0][0], columns=list(extra_columns)) if extra_columns else None
+    return x, y, extra
+
+
+def predict_chunked(model, x):
+    """Predict in row slices: LightGBM may copy its input to float64, which
+    for the full ~41M x 35 matrix alone is ~11 GB."""
+    return np.concatenate([model.predict(x[i:i + PREDICT_CHUNK])
+                           for i in range(0, len(x), PREDICT_CHUNK)])
 
 
 def fbeta(p, r, beta=BETA):
@@ -128,35 +189,50 @@ class ChallengeScorer:
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--version", choices=sorted(VERSIONS), default="v1")
+    version = VERSIONS[ap.parse_args().version]
+    model_name = version["model_name"]
+    features = [c for _, cols in version["sources"] for c in cols]
+
+    def sources(split):
+        return [(MATCHER_DIR / f"matcher_{split}_pairs{suffix}.parquet", cols)
+                for suffix, cols in version["sources"]]
+
     t_start = time.time()
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------ train
-    x, y, _ = load_xy(MATCHER_DIR / "matcher_train_pairs.parquet")
-    log(f"train: {len(y):,} pairs, {int(y.sum()):,} positive ({y.mean():.4%})")
-    train_set = lgb.Dataset(x, label=y, feature_name=FEATURE_COLUMNS, free_raw_data=True)
+    x, y, _ = load_xy(sources("train"))
+    log(f"train: {len(y):,} pairs, {int(y.sum()):,} positive ({y.mean():.4%}), "
+        f"{len(features)} features")
+    train_set = lgb.Dataset(x, label=y, feature_name=features, free_raw_data=True)
+    train_set.construct()
+    del x, y  # LightGBM keeps its own binned copy
     t0 = time.time()
     model = lgb.train(PARAMS, train_set, num_boost_round=NUM_BOOST_ROUND)
     log(f"trained {NUM_BOOST_ROUND} rounds in {time.time() - t0:.1f}s")
-    train_prob = model.predict(x)
+    del train_set
+    xs, ys, _ = load_xy(sources("train"), row_step=TRAIN_METRIC_STEP)
+    train_prob = predict_chunked(model, xs)
     train_scores = {
-        "average_precision": float(average_precision_score(y, train_prob)),
-        "roc_auc": float(roc_auc_score(y, train_prob)),
+        "average_precision": float(average_precision_score(ys, train_prob)),
+        "roc_auc": float(roc_auc_score(ys, train_prob)),
+        "rows_scored": int(len(ys)),
     }
-    del x, y, train_set, train_prob
-    model_path = MODELS_DIR / f"{MODEL_NAME}.txt"
+    del xs, ys, train_prob
+    model_path = MODELS_DIR / f"{model_name}.txt"
     model.save_model(str(model_path))
 
     # ------------------------------------------------------- validation
     xv, yv, ids = load_xy(
-        MATCHER_DIR / "matcher_val_pairs.parquet",
-        extra_columns=("source1_entity_id", "candidate_entity_id"),
+        sources("val"), extra_columns=("source1_entity_id", "candidate_entity_id"),
     )
     t0 = time.time()
-    prob = model.predict(xv)
+    prob = predict_chunked(model, xv)
     log(f"scored {len(yv):,} validation pairs in {time.time() - t0:.1f}s")
     del xv
-    pred_path = MODELS_DIR / f"{MODEL_NAME}_val_predictions.parquet"
+    pred_path = MODELS_DIR / f"{model_name}_val_predictions.parquet"
     pq.write_table(
         ids.append_column("target", pa.array(yv))
            .append_column("pred_prob", pa.array(prob.astype(np.float32))),
@@ -180,11 +256,11 @@ def main():
     best_sweep = sweep.loc[sweep["f0_5"].idxmax()]
     t_opt, p_opt, r_opt, f_opt = best_pair_threshold(yv, prob)
     macro_opt = scorer.score(prob >= t_opt, yv)
-    sweep.to_csv(MODELS_DIR / f"{MODEL_NAME}_threshold_sweep.tsv", sep="\t", index=False)
+    sweep.to_csv(MODELS_DIR / f"{model_name}_threshold_sweep.tsv", sep="\t", index=False)
 
     gain = model.feature_importance("gain")
     importance = pd.DataFrame({
-        "feature": FEATURE_COLUMNS,
+        "feature": features,
         "gain": gain,
         "gain_share": gain / gain.sum(),
         "split_count": model.feature_importance("split"),
@@ -194,7 +270,7 @@ def main():
         "model": str(model_path),
         "params": PARAMS,
         "num_boost_round": NUM_BOOST_ROUND,
-        "features": FEATURE_COLUMNS,
+        "features": features,
         "validation": {
             "candidate_pairs": int(len(yv)),
             "positive_pairs": int(yv.sum()),
@@ -215,7 +291,7 @@ def main():
         "predictions": str(pred_path),
         "runtime_seconds": round(time.time() - t_start, 1),
     }
-    with open(MODELS_DIR / f"{MODEL_NAME}_report.json", "w") as f:
+    with open(MODELS_DIR / f"{model_name}_report.json", "w") as f:
         json.dump(report, f, indent=2)
 
     v = report["validation"]

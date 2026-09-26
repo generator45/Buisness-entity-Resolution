@@ -74,10 +74,16 @@ class TokenSets:
     ``with_tokens`` keeps the CSR token arrays (needed on the side that is
     expanded, i.e. S1); ``with_lookup`` builds the sorted (record, token)
     key array for membership tests (needed on the candidate side).
+
+    Optional rarity weights: ``compute_idf`` derives idf = log(N / df) of
+    each token from this table (the pool); ``idf_from`` instead takes them
+    from another (pool) TokenSets, with unseen tokens getting the maximum
+    idf. Either way ``idf_sum`` is the per-record total idf of meaningful
+    tokens, and ``meaningful_count`` the number of meaningful tokens.
     """
 
     def __init__(self, table: pa.Table, field: str, transform=None, stop=frozenset(),
-                 with_tokens=True, with_lookup=False):
+                 with_tokens=True, with_lookup=False, compute_idf=False, idf_from=None):
         rows, codes, vocab = tokenize(table, field, transform)
         tok_hash = _hash_strings(vocab)
         meaningful = np.array([_is_meaningful(t, stop) for t in vocab], dtype=bool)
@@ -90,19 +96,48 @@ class TokenSets:
         first.sort()  # keep rows ascending for the CSR layout
         rows, codes = rows[first], codes[first]
         self.count = np.bincount(rows, minlength=table.num_rows).astype(np.int32)
+        is_meaningful = meaningful[codes]
+        self.meaningful_count = np.bincount(
+            rows[is_meaningful], minlength=table.num_rows
+        ).astype(np.int32)
+        token_idf = None
+        if compute_idf:
+            th = tok_hash[codes]
+            self.idf_vocab, df = np.unique(th, return_counts=True)
+            self.max_idf = float(np.log(table.num_rows))
+            self.idf_values = np.log(table.num_rows / df)
+            token_idf = self.idf_values[np.searchsorted(self.idf_vocab, th)]
+        elif idf_from is not None:
+            token_idf = idf_from.idf_of(tok_hash[codes])
+            self.max_idf = idf_from.max_idf
+        if token_idf is not None:
+            self.idf_sum = np.bincount(
+                rows, weights=token_idf * is_meaningful, minlength=table.num_rows
+            )
         if with_tokens:
             self.offsets = np.r_[0, np.cumsum(self.count)]
             self.tokens = tok_hash[codes]
-            self.meaningful = meaningful[codes]
+            self.meaningful = is_meaningful
+            if token_idf is not None:
+                self.token_idf = token_idf
 
-    def expand(self, rows: np.ndarray):
-        """(pair index, token, meaningful flag) for every token of ``rows``."""
+    def idf_of(self, tokens: np.ndarray) -> np.ndarray:
+        """idf of hashed tokens; tokens never seen here get the maximum."""
+        pos = np.searchsorted(self.idf_vocab, tokens)
+        pos[pos == len(self.idf_vocab)] = 0
+        found = self.idf_vocab[pos] == tokens
+        return np.where(found, self.idf_values[pos], self.max_idf)
+
+    def expand(self, rows: np.ndarray, with_idf=False):
+        """(pair index, token, meaningful flag[, idf]) for every token of ``rows``."""
         starts = self.offsets[rows]
         lens = self.count[rows]
         total = int(lens.sum())
         pair = np.repeat(np.arange(len(rows)), lens)
         run_starts = np.repeat(np.cumsum(lens) - lens, lens)
         pos = np.repeat(starts, lens) + (np.arange(total) - run_starts)
+        if with_idf:
+            return pair, self.tokens[pos], self.meaningful[pos], self.token_idf[pos]
         return pair, self.tokens[pos], self.meaningful[pos]
 
     def contains(self, rows: np.ndarray, tokens: np.ndarray) -> np.ndarray:
@@ -131,12 +166,23 @@ class StringStats:
 class FieldIndex:
     """Everything the features need about one side (S1 sample or pool)."""
 
-    def __init__(self, table: pa.Table, side: str):
+    def __init__(self, table: pa.Table, side: str, with_idf=False, idf_from=None):
+        """``with_idf``: attach rarity weights to the name / address token sets
+        (computed from this table on the pool side, taken from ``idf_from``,
+        the pool FieldIndex, on the S1 side)."""
         s1 = side == "s1"
         kw = dict(with_tokens=s1, with_lookup=not s1)
-        self.name_tokens = TokenSets(table, NAME_FIELD, stop=NAME_STOP_TOKENS, **kw)
+
+        def idf_kw(attr):
+            if not with_idf:
+                return {}
+            return {"idf_from": getattr(idf_from, attr)} if s1 else {"compute_idf": True}
+
+        self.name_tokens = TokenSets(table, NAME_FIELD, stop=NAME_STOP_TOKENS,
+                                     **kw, **idf_kw("name_tokens"))
         self.name_numbers = TokenSets(table, NAME_FIELD, transform=normalize_house_number, **kw)
-        self.addr_tokens = TokenSets(table, ADDRESS_FIELD, stop=ADDRESS_STOP_TOKENS, **kw)
+        self.addr_tokens = TokenSets(table, ADDRESS_FIELD, stop=ADDRESS_STOP_TOKENS,
+                                     **kw, **idf_kw("addr_tokens"))
         self.addr_numbers = TokenSets(table, ADDRESS_FIELD, transform=normalize_house_number, **kw)
         self.name = StringStats(table, NAME_FIELD)
         self.addr = StringStats(table, ADDRESS_FIELD)

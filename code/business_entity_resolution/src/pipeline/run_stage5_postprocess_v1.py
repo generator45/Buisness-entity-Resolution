@@ -28,9 +28,10 @@ so R1's one-S1-per-candidate rule fires far less often than it will on the
 test set, where every S1 is present.
 
 Run from code/business_entity_resolution/:
-    python3 src/pipeline/run_stage5_postprocess_v1.py
+    python3 src/pipeline/run_stage5_postprocess_v1.py [--version v2]
 """
 
+import argparse
 import itertools
 import json
 import sys
@@ -49,6 +50,7 @@ from config import MODELS_DIR, SEED, STAGING_DIR  # noqa: E402
 from metrics import per_entity_fbeta  # noqa: E402
 from split import load_matcher_split  # noqa: E402
 
+# set by --version in main(); defaults are the V1 artefacts
 PRED_PATH = MODELS_DIR / "matcher_v1_lgbm_val_predictions.parquet"
 OUT_DIR = MODELS_DIR / "matcher_v1_analysis"
 # pairs below this probability are never predicted by any rule in the grids
@@ -250,6 +252,12 @@ def s1_countries(vp: ValPredictions):
 
 
 def main():
+    global PRED_PATH, OUT_DIR
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--version", default="v1")
+    version = ap.parse_args().version
+    PRED_PATH = MODELS_DIR / f"matcher_{version}_lgbm_val_predictions.parquet"
+    OUT_DIR = MODELS_DIR / f"matcher_{version}_analysis"
     t_start = time.time()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     vp = ValPredictions()

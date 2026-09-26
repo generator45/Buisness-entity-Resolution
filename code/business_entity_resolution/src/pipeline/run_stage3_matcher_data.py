@@ -65,18 +65,18 @@ def log(msg):
 
 # ---------------------------------------------------------------- inputs
 
-def load_s1_sample(ids: set):
+def load_s1_sample(ids: set, columns=COLUMNS):
     """S1 rows of one sample, plus their row numbers in train s1.parquet."""
-    s1 = pq.read_table(STAGING_DIR / "train" / "s1.parquet", columns=COLUMNS)
+    s1 = pq.read_table(STAGING_DIR / "train" / "s1.parquet", columns=columns)
     mask = pc.is_in(s1["entity_id"], value_set=pa.array(sorted(ids)))
     rows = np.flatnonzero(mask.to_numpy(zero_copy_only=False))
     return s1.filter(mask).combine_chunks(), rows
 
 
-def load_pool():
+def load_pool(columns=COLUMNS):
     """Train S2 then S3 rows concatenated; also returns the S2 row count."""
-    s2 = pq.read_table(STAGING_DIR / "train" / "s2.parquet", columns=COLUMNS)
-    s3 = pq.read_table(STAGING_DIR / "train" / "s3.parquet", columns=COLUMNS)
+    s2 = pq.read_table(STAGING_DIR / "train" / "s2.parquet", columns=columns)
+    s3 = pq.read_table(STAGING_DIR / "train" / "s3.parquet", columns=columns)
     return pa.concat_tables([s2, s3]).combine_chunks(), s2.num_rows
 
 
@@ -126,22 +126,24 @@ def write_candidates(name, s1, s1_rows, pool, strategies):
 class FeatureChecks:
     """Streaming data-quality checks and per-class feature means."""
 
-    def __init__(self):
+    def __init__(self, columns=FEATURE_COLUMNS, binary=BINARY_FEATURES,
+                 unit_interval=UNIT_INTERVAL_FEATURES):
+        self.columns, self.binary, self.unit_interval = columns, binary, unit_interval
         self.rows = 0
         self.problems = []
-        self.sums = {t: np.zeros(len(FEATURE_COLUMNS)) for t in (0, 1)}
+        self.sums = {t: np.zeros(len(columns)) for t in (0, 1)}
         self.counts = {0: 0, 1: 0}
         self.country_mismatch = 0
 
     def update(self, feats, target, pool_rows, source, n_s2):
         self.rows += len(target)
-        mat = np.column_stack([feats[c].astype(np.float64) for c in FEATURE_COLUMNS])
+        mat = np.column_stack([feats[c].astype(np.float64) for c in self.columns])
         if not np.isfinite(mat).all():
             self.problems.append("non-finite feature values")
-        for c in BINARY_FEATURES:
+        for c in self.binary:
             if not np.isin(feats[c], (0, 1)).all():
                 self.problems.append(f"{c} not binary")
-        for c in UNIT_INTERVAL_FEATURES:
+        for c in self.unit_interval:
             if ((feats[c] < 0) | (feats[c] > 1)).any():
                 self.problems.append(f"{c} outside [0, 1]")
         for pre in ("name", "address"):
@@ -164,7 +166,7 @@ class FeatureChecks:
                 "mean_target_1": self.sums[1][i] / max(self.counts[1], 1),
                 "mean_target_0": self.sums[0][i] / max(self.counts[0], 1),
             }
-            for i, col in enumerate(FEATURE_COLUMNS)
+            for i, col in enumerate(self.columns)
         }
 
 
