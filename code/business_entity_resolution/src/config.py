@@ -44,3 +44,16 @@ SOURCE_SCHEMA = ["entity_id", "business_name", "business_address", "country"]
 GROUND_TRUTH_SCHEMA = ["source1_entity_id", "matched_entity_ids"]
 
 CHUNK_SIZE = 250_000
+
+# --- matcher training-data preparation (stage 3) ---
+# Each matcher sample is this fraction of *all* train S1 entities, drawn
+# (disjointly) from those outside the blocking validation split, which was
+# used to tune blocking caps.
+MATCHER_SAMPLE_FRACTION = 0.10
+MATCHER_SEED = SEED + 1
+MATCHER_DIR = MARTS_DIR / "matcher"
+# pairs processed per feature chunk
+PAIR_CHUNK_SIZE = 2_000_000
+# strong_name_and_address_overlap = name_jaccard >= X and address_jaccard >= Y
+STRONG_NAME_JACCARD = 0.5
+STRONG_ADDRESS_JACCARD = 0.5

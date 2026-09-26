@@ -81,6 +81,14 @@ LEGAL_FORM_TOKENS = frozenset({
 # here: it is also an ordinary word inside names ("Made in Texas").
 WEB_TOKENS = frozenset({"www", "com", "net", "org", "http", "https"})
 
+# Address tokens that say nothing about which premises it is: canonical
+# street-type abbreviations (post ADDRESS_ABBREV_MAP) and common filler
+# ("No. 12", "Near SBI ATM", "Opp. Bus Stand", "P.O."). Used to define
+# "meaningful" address tokens for pairwise features.
+ADDRESS_STOP_TOKENS = frozenset(set(ADDRESS_ABBREV_MAP.values()) | {
+    "no", "near", "nr", "opp", "and", "the", "of", "po", "na",
+})
+
 _WHITESPACE_RE = re.compile(r"\s+")
 _REPEAT_RE = re.compile(r"(.)\1+")
 _VOWELS_RE = re.compile(r"[aeiouy]")

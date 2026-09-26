@@ -32,6 +32,7 @@ from blocking import (  # noqa: E402
     SpacelessNameKey,
     TokenKeys,
 )
+from blocking_config import default_strategies  # noqa: E402
 from blocking_eval import evaluate_blocking, format_report  # noqa: E402
 from config import INTERMEDIATE_DIR, STAGING_DIR  # noqa: E402
 from normalize import consonant_skeleton, phonetic_skeleton  # noqa: E402
@@ -57,33 +58,16 @@ def strategy_sets(max_df, token_max_df, addr_max_df, pair_max_df):
             KeyBlock("exact_name", ExactKey(NORM, by_country=False)),
             KeyBlock(f"name_token[{max_df}]", TokenKeys(NORM, by_country=False), max_df),
         ],
-        # every key scoped by country. Pruned by leave-one-out on validation:
+        # the production configuration (blocking_config.py); --max-df sets the
+        # core-name and spaceless caps. Pruned by leave-one-out on validation:
         # - name_token over translit / skeleton fields: +0.03 pts recall for
         #   ~53 cands/S1 and ~3.5 GB RAM
         # - exact_name, core_name, core_name_translit: each lost <= 16 true
         #   matches when removed; subsumed by the skeleton core key
-        "full": [
-            # token cap: 200 was picked from a 25..1000 sweep, then lowered to 100
-            # once leave-one-out showed it the least efficient strategy (0.61 pts
-            # unique recall for ~30 cands/S1 at cap 200)
-            KeyBlock(
-                f"name_token|country[{token_max_df}]", TokenKeys(NORM), token_max_df
-            ),
-            KeyBlock(
-                f"core_name_phonetic|country[{max_df}]",
-                CoreNameKey(TRANSLIT, transform=phonetic_skeleton),
-                max_df,
-            ),
-            KeyBlock(
-                f"addr_number_x_word_norm|country[{addr_max_df}]",
-                AddressNumberKeys("business_address_translit", normalize_numbers=True),
-                addr_max_df,
-            ),
-            # pair cap from a 10..1000 sweep: 100 keeps ~half the gain of
-            # 1000 at ~10% of its candidate pairs
-            KeyBlock(f"name_pair|country[{pair_max_df}]", NamePairKeys(NORM), pair_max_df),
-            KeyBlock(f"spaceless_name|country[{max_df}]", SpacelessNameKey(TRANSLIT), max_df),
-        ],
+        "full": default_strategies(
+            token_max_df=token_max_df, core_max_df=max_df, addr_max_df=addr_max_df,
+            pair_max_df=pair_max_df, spaceless_max_df=max_df,
+        ),
         # before/after for the cheap fixes: each new variant sits right after
         # the version it replaces, so its new_true is exactly what the fix adds
         "cheap_fixes": [

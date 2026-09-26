@@ -103,8 +103,9 @@ class ParquetChunkWriter:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._writer = None
 
-    def write(self, df: pd.DataFrame):
-        table = pa.Table.from_pandas(df, preserve_index=False)
+    def write(self, df):
+        """Append a pandas DataFrame or a pyarrow Table."""
+        table = df if isinstance(df, pa.Table) else pa.Table.from_pandas(df, preserve_index=False)
         if self._writer is None:
             self._writer = pq.ParquetWriter(self.path, table.schema)
         self._writer.write_table(table)
