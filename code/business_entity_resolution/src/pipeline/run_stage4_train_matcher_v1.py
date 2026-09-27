@@ -50,6 +50,7 @@ from pair_features_v2 import V2_FEATURE_COLUMNS  # noqa: E402
 from pair_features_v3a import V3A_COLUMNS  # noqa: E402
 from pair_features_v3b import V3B_COLUMNS  # noqa: E402
 from pair_features_v3c import V3C_COLUMNS  # noqa: E402
+from pair_features_v3d import V3D_COLUMNS  # noqa: E402
 from split import load_matcher_split  # noqa: E402
 
 # V1 features with zero gain in the V1 model: country is constant (blocking
@@ -81,6 +82,11 @@ VERSIONS = {
     "v4": {"model_name": "matcher_v4_lgbm",
            "sources": [("_v2", V2_NOCOUNT_FEATURES), ("_v3a", V3A_COLUMNS),
                        ("_v3b", V3B_COLUMNS), ("_v3c", V3C_COLUMNS)]},
+    # v4 + name distinctiveness and agreement with the S1's other candidates
+    # (V3d add-on, aimed at pairs with an empty address)
+    "v5": {"model_name": "matcher_v5_lgbm",
+           "sources": [("_v2", V2_NOCOUNT_FEATURES), ("_v3a", V3A_COLUMNS),
+                       ("_v3b", V3B_COLUMNS), ("_v3c", V3C_COLUMNS), ("_v3d", V3D_COLUMNS)]},
 }
 # train-set metrics are computed on every TRAIN_METRIC_STEP-th row, so the full
 # training matrix never has to be held next to LightGBM's binned dataset

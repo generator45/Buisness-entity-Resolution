@@ -10,13 +10,15 @@ no process holds more than one step's indexes):
   v2     V1 + V2 features -> <work>/pairs_v2.parquet (s1_row, pool_row,
          features); written in S1-aligned chunks of ~PAIR_CHUNK_SIZE pairs,
          one row group each
-  v3a, v3b, v3c
+  v3a, v3b, v3c, v3d
          add-on features, one row group per V2 row group (row-aligned; the
          (s1_row, pool_row) of every row is carried along and checked)
-  score  v4 tuned LightGBM over the joined feature files
-         -> <work>/predictions.parquet (s1_row, pool_row, pred_prob)
-  write  post-processing (R3, tuned on matcher_val, see stage 5) and the two
-         submission files; candidate_pairs.tsv is exactly the scored set
+  score  the --model tuned LightGBM (default v5) over the joined feature
+         files -> <work>/predictions_<model>.parquet (s1_row, pool_row,
+         pred_prob)
+  write  post-processing (the model's R3 rule, tuned on matcher_val, see
+         stage 5) and the two submission files; candidate_pairs.tsv is
+         exactly the scored set
   check  streaming format checks of both files (the official validator is
          run separately on matching_results.tsv; on the candidate file it
          would hold ~250M IDs in Python sets)
@@ -59,13 +61,19 @@ from run_stage3b_matcher_features_v2 import V2_COLUMNS, aligned_chunks  # noqa: 
 from run_stage3c_matcher_features_v3a import ADDONS  # noqa: E402
 from run_stage4_train_matcher_v1 import VERSIONS  # noqa: E402
 
-MODEL_VERSION = "v4"
-MODEL_PATH = MODELS_DIR / "matcher_v4_tuned_lgbm.txt"
-# R3 from stage 5 on matcher_v4_tuned (in-sample optimum; out-of-fold macro
-# F0.5 0.9670): each S1's top candidate needs p >= T_TOP, others p >= T_REST
-# and p >= MARGIN * top p; a candidate is only kept for the S1 that gives it
-# the highest p (every S2/S3 ID matches at most one S1 in train ground truth)
-T_TOP, T_REST, MARGIN = 0.70, 0.10, 0.7
+# Each model's R3 rule from stage 5 on matcher_val (in-sample optimum): each
+# S1's top candidate needs p >= t_top, others p >= t_rest and p >= margin *
+# top p; a candidate is only kept for the S1 that gives it the highest p
+# (every S2/S3 ID matches at most one S1 in train ground truth). Per-segment
+# thresholds (R4) gained <= 0.0002 out of fold and are not used.
+MODELS = {
+    # out-of-fold macro F0.5 0.9670
+    "v4": {"path": MODELS_DIR / "matcher_v4_tuned_lgbm.txt",
+           "rule": {"t_top": 0.70, "t_rest": 0.10, "margin": 0.7}},
+    # v4 + V3d features; out-of-fold macro F0.5 0.9705
+    "v5": {"path": MODELS_DIR / "matcher_v5_tuned_lgbm.txt",
+           "rule": {"t_top": 0.75, "t_rest": 0.10, "margin": 0.7}},
+}
 MIN_PROB = 0.02  # as in stage 5; every rule threshold is above it
 S1_PART = 120_000  # multiple of the blocking chunk (20,000); about half a matcher sample
 BLOCK_CHUNK = 20_000
@@ -100,8 +108,8 @@ class ParquetChunkWriter:
 
 
 class Run:
-    def __init__(self, limit):
-        self.limit = limit
+    def __init__(self, limit, model):
+        self.limit, self.model = limit, model
         tag = "test" if limit is None else f"test_trial_{limit}"
         self.work = INTERMEDIATE_DIR / tag
         self.out = OUTPUT_DIR if limit is None else INTERMEDIATE_DIR / tag / "output"
@@ -245,19 +253,19 @@ def step_addon(run: Run, suffix):
 # ------------------------------------------------------------------ score
 
 def step_score(run: Run):
-    sources = VERSIONS[MODEL_VERSION]["sources"]
+    sources = VERSIONS[run.model]["sources"]
     files = [(pq.ParquetFile(run.path(f"pairs{suffix}.parquet")), cols) for suffix, cols in sources]
     n_rg = files[0][0].metadata.num_row_groups
     for f, _ in files:
         if f.metadata.num_row_groups != n_rg:
             raise ValueError("feature files have different row groups")
-    model = lgb.Booster(model_file=str(MODEL_PATH))
+    model = lgb.Booster(model_file=str(MODELS[run.model]["path"]))
     features = [c for _, cols in sources for c in cols]
     if model.feature_name() != features:
         raise ValueError("model features differ from the feature files")
     n_total = files[0][0].metadata.num_rows
     done = 0
-    with ParquetChunkWriter(run.path("predictions.parquet")) as writer:
+    with ParquetChunkWriter(run.path(f"predictions_{run.model}.parquet")) as writer:
         for rg in range(n_rg):
             first = None
             x = None
@@ -283,7 +291,7 @@ def step_score(run: Run):
 
 # ------------------------------------------------------------------ write
 
-def select_matches(s1, cand, p):
+def select_matches(s1, cand, p, t_top, t_rest, margin):
     """R3 rule over pairs with p >= MIN_PROB; returns a boolean mask."""
     # one S1 per candidate: the S1 giving the candidate its highest p
     order = np.lexsort((-p, cand))
@@ -299,8 +307,8 @@ def select_matches(s1, cand, p):
     top_p = np.zeros(int(s1.max()) + 1 if len(s1) else 0)
     top_p[s1[order[first]]] = p[order[first]]
     tp = top_p[s1]
-    rest = ~is_top & (p >= T_REST) & (tp >= T_TOP) & (p >= MARGIN * tp)
-    return winner & ((is_top & (p >= T_TOP)) | rest)
+    rest = ~is_top & (p >= t_rest) & (tp >= t_top) & (p >= margin * tp)
+    return winner & ((is_top & (p >= t_top)) | rest)
 
 
 def join_lists(s1_ids, n_s1, s1_row, ids):
@@ -321,12 +329,13 @@ def step_write(run: Run):
     n_s1 = len(s1_ids)
 
     # --- matches
-    pred = pq.read_table(run.path("predictions.parquet"),
+    rule = MODELS[run.model]["rule"]
+    pred = pq.read_table(run.path(f"predictions_{run.model}.parquet"),
                          filters=[("pred_prob", ">=", MIN_PROB)])
     s1 = pred["s1_row"].to_numpy().astype(np.int64)
     cand = pred["pool_row"].to_numpy().astype(np.int64)
     p = pred["pred_prob"].to_numpy().astype(np.float64)
-    keep = select_matches(s1, cand, p)
+    keep = select_matches(s1, cand, p, **rule)
     order = np.lexsort((-p[keep], s1[keep]))  # by S1, most confident first
     m_s1, m_cand = s1[keep][order], cand[keep][order]
     lines = join_lists(s1_ids, n_s1, m_s1, pool_ids.take(pa.array(m_cand)))
@@ -340,7 +349,7 @@ def step_write(run: Run):
         "s1_with_matches": int((n_matched > 0).sum()),
         "s1_singletons_predicted": int((n_matched == 0).sum()),
         "avg_matches_per_s1": float(n_matched.mean()),
-        "rule": {"t_top": T_TOP, "t_rest": T_REST, "margin": MARGIN, "one_s1_per_candidate": True},
+        "model": run.model, "rule": {**rule, "one_s1_per_candidate": True},
     }
     del pred, s1, cand, p, keep, lines
     gc.collect()
@@ -361,7 +370,7 @@ def step_write(run: Run):
             lines = join_lists(s1_ids.slice(a, b - a), b - a, c_s1[lo:hi] - a, ids)
             f.write("\n".join(lines.to_pylist()) + "\n")
     stats["candidate_pairs"] = int(len(c_s1))
-    json.dump(stats, open(run.path("output_stats.json"), "w"), indent=2)
+    json.dump(stats, open(run.path(f"output_stats_{run.model}.json"), "w"), indent=2)
     log(f"wrote {match_path} and {cand_path} ({len(c_s1):,} candidate pairs)")
 
 
@@ -402,7 +411,7 @@ def step_check(run: Run):
         else:
             if i + 1 != len(s1_ids) or fm.readline() or fc.readline():
                 problems.append("row count differs from test S1")
-    n_scored = pq.ParquetFile(run.path("predictions.parquet")).metadata.num_rows
+    n_scored = pq.ParquetFile(run.path(f"predictions_{run.model}.parquet")).metadata.num_rows
     if n_cand_ids != n_scored:
         problems.append(f"candidate ids {n_cand_ids} != scored pairs {n_scored}")
     log(f"check: {len(s1_ids):,} S1 rows, {n_cand_ids:,} candidate ids, "
@@ -413,7 +422,7 @@ def step_check(run: Run):
 
 STEPS = {"block": step_block, "v2": step_v2,
          "v3a": lambda r: step_addon(r, "v3a"), "v3b": lambda r: step_addon(r, "v3b"),
-         "v3c": lambda r: step_addon(r, "v3c"),
+         "v3c": lambda r: step_addon(r, "v3c"), "v3d": lambda r: step_addon(r, "v3d"),
          "score": step_score, "write": step_write, "check": step_check}
 
 
@@ -421,9 +430,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--step", choices=list(STEPS), required=True)
     ap.add_argument("--limit", type=int, default=None, help="first N test S1 only (trial)")
+    ap.add_argument("--model", choices=sorted(MODELS), default="v5")
     args = ap.parse_args()
     t0 = time.time()
-    STEPS[args.step](Run(args.limit))
+    STEPS[args.step](Run(args.limit, args.model))
     log(f"step {args.step} done in {time.time() - t0:.0f}s")
 
 

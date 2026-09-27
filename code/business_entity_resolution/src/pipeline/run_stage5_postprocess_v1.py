@@ -17,6 +17,10 @@ Post-processing rule families, each tuned for macro F0.5:
 - R2 R1 + separate thresholds for each S1's top candidate (t_top, which
      also decides singleton vs non-singleton) and its other candidates (t_rest)
 - R3 R2 + relative margin: other candidates also need p >= r * top_p
+- R4 R3 with separate t_top / t_rest per segment of the pair: whether
+     either address is empty ("addr"), or that crossed with the S1's country
+     ("country x addr"); tuned by coordinate ascent from the fold's R3 optimum
+     (margin kept), so a segment only moves off R3 where that pays
 
 Honest estimates: every rule is tuned on one half of the validation S1s and
 scored on the other half, then the halves swap (2-fold cross-fitting at S1
@@ -46,7 +50,7 @@ import pyarrow as pa  # noqa: E402
 import pyarrow.compute as pc  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
 
-from config import MODELS_DIR, SEED, STAGING_DIR  # noqa: E402
+from config import MATCHER_DIR, MODELS_DIR, SEED, STAGING_DIR  # noqa: E402
 from metrics import per_entity_fbeta  # noqa: E402
 from split import load_matcher_split  # noqa: E402
 
@@ -95,6 +99,14 @@ class ValPredictions:
         self.cand_ids = cand.dictionary
         self.missed_below_min = int((y_all & ~keep).sum())
         del tbl, enc, s1_all, y_all, p_all
+        # segment inputs; the predictions are row-aligned with the V2 file
+        v2 = pq.read_table(MATCHER_DIR / "matcher_val_pairs_v2.parquet",
+                           columns=["address_missing_either"])
+        if v2.num_rows != self.n_pairs:
+            raise ValueError("V2 file not row-aligned with the predictions")
+        self.addr_missing = v2["address_missing_either"].to_numpy()[keep].astype(np.int64)
+        del v2
+        self.country = None  # per S1, set by main() for the country segments
 
         # candidate -> best S1 (highest probability) for the one-S1-per-candidate rule
         order = np.lexsort((-self.p, self.cand))
@@ -116,6 +128,26 @@ class ValPredictions:
         top_p = np.zeros(self.n)
         top_p[self.s1[order[first]]] = self.p[order[first]]
         return is_top, top_p
+
+    def segments(self, scheme):
+        """Segment id per row and the segment names."""
+        if scheme == "addr":
+            return self.addr_missing, ["address present", "address missing"]
+        countries = sorted(set(self.country))
+        code = pd.Index(countries).get_indexer(self.country)[self.s1]
+        names = [f"{c}, {a}" for c in countries for a in ("address present", "address missing")]
+        return code * 2 + self.addr_missing, names
+
+    def predict_seg(self, seg, t_top, t_rest, margin):
+        """R3 (one S1 per candidate) with per-segment thresholds (arrays)."""
+        is_top, top_p = self.top[True]
+        tt, tr = np.asarray(t_top)[seg], np.asarray(t_rest)[seg]
+        top_rows = np.flatnonzero(is_top)
+        top_ok = np.zeros(self.n, bool)
+        top_ok[self.s1[top_rows]] = self.p[top_rows] >= tt[top_rows]
+        tp = top_p[self.s1]
+        rest = ~is_top & (self.p >= tr) & top_ok[self.s1] & (self.p >= margin * tp)
+        return self.winner & ((is_top & (self.p >= tt)) | rest)
 
     def predict(self, t_top, t_rest, margin=0.0, dedupe=False):
         eligible = self.winner if dedupe else np.ones(len(self.p), bool)
@@ -162,6 +194,53 @@ def cross_fit(vp: ValPredictions, res: pd.DataFrame):
         "in_sample_macro_f0_5": float(in_sample["all"]),
         "in_sample_params": in_sample[param_cols].to_dict(),
         "fold_params": chosen,
+    }
+
+
+def tune_segments(vp: ValPredictions, seg, n_seg, start, fold_mask, passes=2):
+    """Coordinate ascent over per-segment (t_top, t_rest) on the S1s in
+    ``fold_mask``, from the R3 parameters ``start`` (margin kept fixed)."""
+    t_top = np.full(n_seg, start["t_top"])
+    t_rest = np.full(n_seg, start["t_rest"])
+    margin = start["margin"]
+
+    def score(tt, tr):
+        return vp.f_per_s1(vp.predict_seg(seg, tt, tr, margin))[fold_mask].mean()
+
+    best = score(t_top, t_rest)
+    for _ in range(passes):
+        for k in range(n_seg):
+            for arr in (t_top, t_rest):
+                for v in FINE:
+                    old = arr[k]
+                    arr[k] = v
+                    f = score(t_top, t_rest)
+                    if f > best + 1e-9:
+                        best = f
+                    else:
+                        arr[k] = old
+    return {"t_top": t_top.tolist(), "t_rest": t_rest.tolist(), "margin": margin}, best
+
+
+def cross_fit_segments(vp: ValPredictions, scheme, r3_summary):
+    """Out-of-fold macro F0.5 of segment thresholds (tune on one fold, score
+    on the other), plus the parameters tuned on all validation S1s."""
+    seg, names = vp.segments(scheme)
+    f_oof = np.zeros(vp.n)
+    fold_params = {}
+    for k in (0, 1):
+        start = r3_summary["fold_params"][f"tuned_on_fold{1 - k}"]
+        params, _ = tune_segments(vp, seg, len(names), start, vp.fold == 1 - k)
+        fold_params[f"tuned_on_fold{1 - k}"] = params
+        f = vp.f_per_s1(vp.predict_seg(seg, **params))
+        f_oof[vp.fold == k] = f[vp.fold == k]
+    params, f_all = tune_segments(vp, seg, len(names), r3_summary["in_sample_params"],
+                                  np.ones(vp.n, bool))
+    return {
+        "oof_macro_f0_5": float(f_oof.mean()),
+        "in_sample_macro_f0_5": float(f_all),
+        "in_sample_params": {"segments": names, **params},
+        "fold_params": fold_params,
     }
 
 
@@ -286,11 +365,24 @@ def main():
             f"oof {summary[name]['oof_macro_f0_5']:.4f}")
     pd.concat(all_res).to_csv(OUT_DIR / "postprocess_grid.tsv", sep="\t", index=False)
 
+    # ---- R4: per-segment thresholds, starting from R3
+    vp.country = s1_countries(vp)
+    for scheme, name in (("addr", "R4 segments: addr"), ("country_addr", "R4 segments: country x addr")):
+        t0 = time.time()
+        summary[name] = cross_fit_segments(vp, scheme, summary["R3 + relative margin"])
+        log(f"{name}: tuned in {time.time() - t0:.0f}s -> oof {summary[name]['oof_macro_f0_5']:.4f}")
+
     # ---- diagnostics at the V1 reference point (t=0.60) and at the best rule
     base_pred = vp.predict(0.60, 0.60)
     best_name = max(summary, key=lambda k: summary[k]["oof_macro_f0_5"])
     best_params = summary[best_name]["in_sample_params"]
-    best_pred = vp.predict(**best_params)
+    if "segments" in best_params:
+        scheme = "addr" if best_name.endswith(": addr") else "country_addr"
+        seg, _ = vp.segments(scheme)
+        best_pred = vp.predict_seg(seg, best_params["t_top"], best_params["t_rest"],
+                                   best_params["margin"])
+    else:
+        best_pred = vp.predict(**best_params)
     decomp = {"V1 t=0.60": decomposition(vp, base_pred), best_name: decomposition(vp, best_pred)}
 
     both = base_pred & ~vp.winner
@@ -300,8 +392,7 @@ def main():
         "predicted_pairs_at_t0.60": int(base_pred.sum()),
     }
 
-    country = s1_countries(vp)
-    breakdown = loss_breakdown(vp, best_pred, country)
+    breakdown = loss_breakdown(vp, best_pred, vp.country)
     samples = error_samples(vp, best_pred)
     for kind, df in samples.items():
         df.to_csv(OUT_DIR / f"{kind}_sample.tsv", sep="\t", index=False)

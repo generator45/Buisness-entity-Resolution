@@ -5,14 +5,14 @@ chunks (the same order stage 3b wrote the V2 file), takes any V2 inputs the
 add-on needs from <sample>_pairs_v2.parquet, computes the add-on's features
 and writes data/marts/matcher/<sample>_pairs_<addon>.parquet (features +
 target). Add-ons (see ADDONS): v3a (pair_features_v3a), v3b
-(pair_features_v3b), v3c (pair_features_v3c).
+(pair_features_v3b), v3c (pair_features_v3c), v3d (pair_features_v3d).
 
 Row alignment with the V2 file is verified on every row: S1 and candidate
 IDs recomputed from the candidate pairs must equal the V2 file's IDs, and the
 targets must agree. Training joins the files by row position.
 
 Run from code/business_entity_resolution/ after stage 3b:
-    python3 src/pipeline/run_stage3c_matcher_features_v3a.py [--addon v3b|v3c]
+    python3 src/pipeline/run_stage3c_matcher_features_v3a.py [--addon v3b|v3c|v3d]
 """
 
 import argparse
@@ -54,6 +54,12 @@ from pair_features_v3c import (  # noqa: E402
     FieldIndexV3c,
     compute_features_v3c,
 )
+from pair_features_v3d import (  # noqa: E402
+    V3D_DTYPES,
+    V3D_INPUTS,
+    FieldIndexV3d,
+    compute_features_v3d,
+)
 from run_stage3_matcher_data import CANDIDATE_DIR, SAMPLES, load_pool, load_s1_sample, log  # noqa: E402
 from run_stage3b_matcher_features_v2 import aligned_chunks  # noqa: E402
 from split import load_matcher_split  # noqa: E402
@@ -81,6 +87,15 @@ ADDONS = {
         "ranges": {"cand_address_key_idf": (-1.0, 1.0), "s1_address_key_idf": (-1.0, 1.0),
                    "cand_address_distinct_names": (-1.0, None),
                    "s1_address_distinct_names": (-1.0, None)},
+    },
+    "v3d": {
+        "index": FieldIndexV3d, "compute": compute_features_v3d, "v2_inputs": V3D_INPUTS,
+        "dtypes": V3D_DTYPES,
+        "columns": ["entity_id", NAME_FIELD, ADDRESS_FIELD, "country"],
+        "ranges": {"cand_name_pool_df": (-1.0, None), "s1_name_pool_df": (-1.0, None),
+                   "group_strong_count": (0.0, None),
+                   "name_sim_to_reference": (-1.0, 1.0),
+                   "address_sim_to_reference": (-1.0, 1.0)},
     },
 }
 
